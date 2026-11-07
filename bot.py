@@ -97,31 +97,54 @@ def send_telegram(message):
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-    try:
-        response = session.post(
-            url,
-            data={
-                "chat_id": CHAT_ID,
-                "text": message,
-                "disable_web_page_preview": True
-            },
-            timeout=20
-        )
+    for attempt in range(5):
+        try:
+            response = session.post(
+                url,
+                data={
+                    "chat_id": CHAT_ID,
+                    "text": message,
+                    "disable_web_page_preview": True
+                },
+                timeout=20
+            )
 
-        response.raise_for_status()
+            if response.status_code == 429:
+                try:
+                    wait_time = int(
+                        response.json().get(
+                            "parameters", {}
+                        ).get("retry_after", 5)
+                    )
+                except Exception:
+                    wait_time = 5
 
-        result = response.json()
+                logging.warning(
+                    f"Telegram rate limit. Waiting {wait_time} seconds."
+                )
 
-        if result.get("ok"):
-            return True
+                time.sleep(wait_time + 1)
+                continue
 
-        logging.error(f"Telegram error: {result}")
-        return False
+            response.raise_for_status()
 
-    except Exception as error:
-        logging.error(f"Telegram sending error: {error}")
-        return False
+            result = response.json()
 
+            if result.get("ok"):
+                time.sleep(1.2)
+                return True
+
+            logging.error(f"Telegram error: {result}")
+            return False
+
+        except Exception as error:
+            logging.error(
+                f"Telegram sending error: {error}"
+            )
+            time.sleep(2)
+
+    logging.error("Telegram sending failed after 5 attempts.")
+    return False
 
 # ==========================================
 # ARABIC TRANSLATION
