@@ -347,13 +347,24 @@ def fetch_nasdaq_exchange(exchange):
     limit = 5000
 
     try:
+        # واجهة Nasdaq العامة تستخدم غالباً data.table.rows،
+        # وقد تختلف الاستجابة بين tableonly=true/false؛ لذلك ندعم الشكلين.
+        exchange_param = exchange.lower()
+
         r = session.get(
             NASDAQ_API,
             params={
-                "tableonly": "true",
+                "tableonly": "false",
                 "limit": limit,
                 "offset": offset,
-                "exchange": exchange
+                "exchange": exchange_param,
+                "download": "true"
+            },
+            headers={
+                "User-Agent": HEADERS["User-Agent"],
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://www.nasdaq.com",
+                "Referer": "https://www.nasdaq.com/market-activity/stocks/screener"
             },
             timeout=35
         )
@@ -361,19 +372,39 @@ def fetch_nasdaq_exchange(exchange):
         payload = r.json()
 
         data = payload.get("data") or {}
-        page_rows = data.get("rows") or []
+        table = data.get("table") or {}
+        page_rows = (
+            table.get("rows")
+            or data.get("rows")
+            or payload.get("rows")
+            or []
+        )
 
         if not isinstance(page_rows, list):
-            logging.warning(f"Nasdaq {exchange}: unexpected rows format")
+            logging.warning(
+                f"Nasdaq {exchange}: unexpected rows format; "
+                f"data keys={list(data.keys())}"
+            )
             return []
 
         rows.extend(page_rows)
 
-        total = parse_number(data.get("totalrecords"))
+        total = parse_number(
+            data.get("totalrecords")
+            or table.get("totalrecords")
+        )
         if total and total > limit:
             logging.warning(
                 f"Nasdaq {exchange}: returned {len(page_rows)} of "
                 f"{int(total)} rows; only first page is loaded"
+            )
+
+        if not page_rows:
+            logging.warning(
+                f"Nasdaq {exchange}: zero rows. "
+                f"HTTP={r.status_code}; top_keys={list(payload.keys())}; "
+                f"data_keys={list(data.keys())}; "
+                f"table_keys={list(table.keys()) if isinstance(table, dict) else 'N/A'}"
             )
 
         logging.info(
@@ -896,4 +927,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(
