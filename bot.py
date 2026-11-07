@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -39,9 +38,12 @@ YAHOO_CHART_URL = (
 
 NY_TIMEZONE = ZoneInfo("America/New_York")
 
+
 # ==================================================
 # SETTINGS
 # ==================================================
+
+MAX_STOCK_PRICE = 5.00
 
 TOP_GAINERS_COUNT = 10
 
@@ -49,11 +51,14 @@ MAX_SCAN_SYMBOLS = 20
 
 MAX_NEWS_SYMBOLS = 10
 
+# الحد الأقصى للتحقق من الأسعار في كل تشغيل
+MAX_PRICE_CHECKS = 45
+
 PRICE_CHANGE_LIMIT = 5.0
 
 MOMENTUM_LIMIT = 2.5
 
-# Nasdaq / NYSE / NYSE American only
+# Nasdaq / NYSE / NYSE American فقط
 ALLOWED_EXCHANGES = {
     "NMS",
     "NGM",
@@ -66,7 +71,7 @@ ALLOWED_EXCHANGES = {
 WHALE_DATA_AVAILABLE = False
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 ForasMarketUS/4.0"
+    "User-Agent": "Mozilla/5.0 ForasMarketUS/5.0"
 }
 
 logging.basicConfig(
@@ -76,6 +81,12 @@ logging.basicConfig(
 
 session = requests.Session()
 session.headers.update(HEADERS)
+
+# تخزين أسعار الأسهم خلال التشغيل الواحد
+PRICE_CACHE = {}
+
+# عداد طلبات التحقق من الأسعار
+PRICE_CHECK_COUNT = 0
 
 
 # ==================================================
@@ -87,7 +98,9 @@ def now_ny():
 
 
 def ny_time_text():
-    return now_ny().strftime("%Y-%m-%d %I:%M:%S %p ET")
+    return now_ny().strftime(
+        "%Y-%m-%d %I:%M:%S %p ET"
+    )
 
 
 def is_market_open():
@@ -117,6 +130,7 @@ def is_market_open():
 def load_state():
 
     try:
+
         with open(
             STATE_FILE,
             "r",
@@ -141,6 +155,7 @@ state = load_state()
 def save_state():
 
     try:
+
         state["sent"] = state.get("sent", [])[-5000:]
 
         with open(
@@ -157,7 +172,10 @@ def save_state():
             )
 
     except Exception as error:
-        logging.error(f"State save error: {error}")
+
+        logging.error(
+            f"State save error: {error}"
+        )
 
 
 def make_id(value):
@@ -182,10 +200,42 @@ def remember(alert_id):
 # TELEGRAM
 # ==================================================
 
+def split_message(message, limit=3900):
+
+    if len(message) <= limit:
+        return [message]
+
+    chunks = []
+    current = ""
+
+    for paragraph in message.split("\n"):
+
+        addition = paragraph + "\n"
+
+        if len(current) + len(addition) > limit:
+
+            if current:
+                chunks.append(current.strip())
+
+            current = addition
+
+        else:
+            current += addition
+
+    if current:
+        chunks.append(current.strip())
+
+    return chunks
+
+
 def send_telegram(message):
 
     if not TOKEN or not CHAT_ID:
-        logging.error("Telegram configuration missing.")
+
+        logging.error(
+            "Telegram configuration missing."
+        )
+
         return False
 
     url = (
@@ -193,58 +243,70 @@ def send_telegram(message):
         f"{TOKEN}/sendMessage"
     )
 
-    for attempt in range(5):
+    chunks = split_message(message)
 
-        try:
+    for chunk in chunks:
 
-            response = session.post(
-                url,
-                data={
-                    "chat_id": CHAT_ID,
-                    "text": message,
-                    "disable_web_page_preview": True
-                },
-                timeout=25
-            )
+        sent = False
 
-            if response.status_code == 429:
+        for attempt in range(5):
 
-                try:
-                    wait_time = int(
-                        response.json()
-                        .get("parameters", {})
-                        .get("retry_after", 10)
-                    )
-                except Exception:
-                    wait_time = 10
+            try:
 
-                logging.warning(
-                    f"Telegram rate limit: {wait_time}"
+                response = session.post(
+                    url,
+                    data={
+                        "chat_id": CHAT_ID,
+                        "text": chunk,
+                        "disable_web_page_preview": True
+                    },
+                    timeout=25
                 )
 
-                time.sleep(wait_time + 1)
-                continue
+                if response.status_code == 429:
 
-            response.raise_for_status()
+                    try:
 
-            result = response.json()
+                        wait_time = int(
+                            response.json()
+                            .get("parameters", {})
+                            .get("retry_after", 10)
+                        )
 
-            if result.get("ok"):
-                time.sleep(1.2)
-                return True
+                    except Exception:
+                        wait_time = 10
 
-            logging.error(f"Telegram error: {result}")
+                    time.sleep(wait_time + 1)
+                    continue
+
+                response.raise_for_status()
+
+                result = response.json()
+
+                if result.get("ok"):
+
+                    sent = True
+                    time.sleep(1.2)
+                    break
+
+                logging.error(
+                    f"Telegram error: {result}"
+                )
+
+                return False
+
+            except Exception as error:
+
+                logging.error(
+                    f"Telegram sending error: {error}"
+                )
+
+                time.sleep(3)
+
+        if not sent:
             return False
 
-        except Exception as error:
-
-            logging.error(
-                f"Telegram sending error: {error}"
-            )
-
-            time.sleep(3)
-
-    return False
+    return True
 
 
 # ==================================================
@@ -291,7 +353,6 @@ def translate_arabic(text):
     if not text:
         return ""
 
-    # تقسيم النص الطويل حتى لا يتجاوز حد الطلب
     chunks = [
         text[index:index + 2500]
         for index in range(0, len(text), 2500)
@@ -307,7 +368,7 @@ def translate_arabic(text):
 
         time.sleep(0.2)
 
-    return "".join(translated_chunks)
+    return "\n".join(translated_chunks)
 
 
 # ==================================================
@@ -344,10 +405,27 @@ def finnhub_request(endpoint, params=None):
 
 
 # ==================================================
-# STOCK PRICE
+# VERIFIED STOCK PRICE
 # ==================================================
 
 def get_stock_price(symbol):
+
+    global PRICE_CHECK_COUNT
+
+    symbol = symbol.upper()
+
+    if symbol in PRICE_CACHE:
+        return PRICE_CACHE[symbol]
+
+    if PRICE_CHECK_COUNT >= MAX_PRICE_CHECKS:
+
+        logging.warning(
+            "Maximum price checks reached."
+        )
+
+        return None
+
+    PRICE_CHECK_COUNT += 1
 
     quote = finnhub_request(
         "quote",
@@ -355,6 +433,8 @@ def get_stock_price(symbol):
     )
 
     if not isinstance(quote, dict):
+
+        PRICE_CACHE[symbol] = None
         return None
 
     try:
@@ -362,12 +442,27 @@ def get_stock_price(symbol):
         price = float(quote.get("c", 0))
 
         if price > 0:
+
+            PRICE_CACHE[symbol] = price
+
+            time.sleep(0.15)
+
             return price
 
     except (ValueError, TypeError):
         pass
 
+    PRICE_CACHE[symbol] = None
+
     return None
+
+
+def is_eligible_price(price):
+
+    return (
+        price is not None
+        and 0 < price < MAX_STOCK_PRICE
+    )
 
 
 def format_price(price):
@@ -413,7 +508,7 @@ def get_market_movers():
 
         quotes = results[0].get("quotes", [])
 
-        movers = []
+        candidates = []
 
         for item in quotes:
 
@@ -440,7 +535,7 @@ def get_market_movers():
 
             try:
 
-                price = float(
+                yahoo_price = float(
                     item.get("regularMarketPrice", 0)
                 )
 
@@ -454,22 +549,57 @@ def get_market_movers():
             except (ValueError, TypeError):
                 continue
 
-            if price <= 0:
+            # استبعاد الأسهم التي لا تحقق الشرط
+            # حتى قبل طلب التحقق من Finnhub
+            if not is_eligible_price(yahoo_price):
                 continue
 
-            movers.append({
+            candidates.append({
                 "symbol": symbol,
-                "price": price,
+                "yahoo_price": yahoo_price,
                 "change": change,
                 "exchange": exchange
             })
 
-        movers.sort(
+        candidates.sort(
             key=lambda item: item["change"],
             reverse=True
         )
 
-        return movers[:100]
+        verified_movers = []
+
+        # التحقق من السعر الحالي عبر Finnhub
+        for item in candidates:
+
+            if len(verified_movers) >= MAX_PRICE_CHECKS:
+                break
+
+            symbol = item["symbol"]
+
+            current_price = get_stock_price(symbol)
+
+            # لا إرسال دون سعر موثوق
+            if not is_eligible_price(current_price):
+                continue
+
+            verified_movers.append({
+                "symbol": symbol,
+                "price": current_price,
+                "change": item["change"],
+                "exchange": item["exchange"]
+            })
+
+        verified_movers.sort(
+            key=lambda item: item["change"],
+            reverse=True
+        )
+
+        logging.info(
+            f"Verified eligible stocks: "
+            f"{len(verified_movers)}"
+        )
+
+        return verified_movers
 
     except Exception as error:
 
@@ -486,11 +616,18 @@ def get_market_movers():
 
 def process_top_gainers(movers):
 
-    if not movers:
-        logging.warning("No market movers available.")
+    eligible = [
+        item for item in movers
+        if is_eligible_price(item.get("price"))
+    ]
+
+    if not eligible:
+        logging.warning(
+            "No eligible stocks for top gainers."
+        )
         return 0
 
-    top = movers[:TOP_GAINERS_COUNT]
+    top = eligible[:TOP_GAINERS_COUNT]
 
     lines = []
 
@@ -509,10 +646,10 @@ def process_top_gainers(movers):
         )
 
     message = (
-        "🏆 أعلى الأسهم الرابحة\n\n"
+        "🏆 أعلى الأسهم الرابحة تحت 5 دولارات\n\n"
         + "\n".join(lines)
         + f"\n\n🕒 {ny_time_text()}"
-        + "\nالمصدر: Yahoo Finance"
+        + "\nالمصدر: Yahoo Finance / Finnhub"
     )
 
     report_id = make_id(
@@ -547,6 +684,9 @@ def process_price_moves(movers):
         price = item["price"]
         change = item["change"]
 
+        if not is_eligible_price(price):
+            continue
+
         if abs(change) < PRICE_CHANGE_LIMIT:
             continue
 
@@ -557,16 +697,13 @@ def process_price_moves(movers):
         if already_sent(alert_id):
             continue
 
-        if change > 0:
-            emoji = "🚀"
-        else:
-            emoji = "🔻"
+        emoji = "🚀" if change > 0 else "🔻"
 
         message = (
             f"{emoji} {symbol} ${price:.4f}\n\n"
             f"التغير اليومي: {change:+.2f}%\n\n"
             f"🕒 {ny_time_text()}\n"
-            "المصدر: Yahoo Finance"
+            "المصدر: Yahoo Finance / Finnhub"
         )
 
         if send_telegram(message):
@@ -642,10 +779,13 @@ def process_momentum(movers):
 
     today = now_ny().strftime("%Y-%m-%d")
 
-    # نفحص عدداً محدوداً لتقليل طلبات البيانات
     for item in movers[:MAX_SCAN_SYMBOLS]:
 
         symbol = item["symbol"]
+        price = item["price"]
+
+        if not is_eligible_price(price):
+            continue
 
         closes = get_intraday_candles(symbol)
 
@@ -691,7 +831,7 @@ def process_momentum(movers):
             direction = "زخم هابط"
 
         message = (
-            f"{emoji} {symbol} ${item['price']:.4f}\n\n"
+            f"{emoji} {symbol} ${price:.4f}\n\n"
             f"{direction}\n"
             f"حركة آخر 15 دقيقة تقريباً: {move:+.2f}%\n\n"
             f"🕒 {ny_time_text()}\n"
@@ -722,6 +862,12 @@ def process_company_news(symbols):
 
     for symbol in symbols[:MAX_NEWS_SYMBOLS]:
 
+        # التحقق من السعر قبل طلب الأخبار
+        price = get_stock_price(symbol)
+
+        if not is_eligible_price(price):
+            continue
+
         articles = finnhub_request(
             "company-news",
             {
@@ -735,6 +881,10 @@ def process_company_news(symbols):
             continue
 
         for article in articles[:3]:
+
+            # إعادة التأكد من أهلية السعر
+            if not is_eligible_price(price):
+                continue
 
             headline = article.get(
                 "headline", ""
@@ -764,12 +914,14 @@ def process_company_news(symbols):
             if already_sent(alert_id):
                 continue
 
-            # نعرض النص المتاح من المصدر كاملاً دون اختصار
-            full_text = summary if summary else headline
+            # نعرض العنوان والملخص المتاحين من المصدر
+            # ولا ندعي أن الملخص هو المقال الكامل
+            full_text = headline
+
+            if summary:
+                full_text += "\n\n" + summary
 
             arabic_text = translate_arabic(full_text)
-
-            price = get_stock_price(symbol)
 
             article_time = "غير متاح"
 
@@ -897,17 +1049,22 @@ def process_halts():
 
         symbol = extract_halt_symbol(full_text)
 
+        # لا نرسل حدثاً إذا لم نستطع تحديد الرمز
+        if symbol == "غير محدد":
+            continue
+
+        price = get_stock_price(symbol)
+
+        # شرط السعر إلزامي في HALT أيضاً
+        if not is_eligible_price(price):
+            continue
+
         alert_id = make_id(
             f"HALT|{symbol}|{full_text}|{link}"
         )
 
         if already_sent(alert_id):
             continue
-
-        price = None
-
-        if symbol != "غير محدد":
-            price = get_stock_price(symbol)
 
         message = (
             f"🔴 {symbol} {format_price(price)}\n\n"
@@ -955,8 +1112,19 @@ def process_whale_alerts():
 
 def main():
 
+    global PRICE_CACHE
+    global PRICE_CHECK_COUNT
+
+    # إعادة تهيئة التخزين عند كل تشغيل
+    PRICE_CACHE = {}
+    PRICE_CHECK_COUNT = 0
+
     logging.info(
         "Foras Market US scan started"
+    )
+
+    logging.info(
+        f"Maximum stock price: ${MAX_STOCK_PRICE:.2f}"
     )
 
     if not TOKEN or not CHAT_ID:
@@ -984,8 +1152,7 @@ def main():
     if not movers:
 
         logging.warning(
-            "No market movers returned. "
-            "Check Yahoo Finance data availability."
+            "No verified stocks under $5 returned."
         )
 
         save_state()
@@ -1004,6 +1171,7 @@ def main():
     news_symbols = [
         item["symbol"]
         for item in movers[:MAX_NEWS_SYMBOLS]
+        if is_eligible_price(item["price"])
     ]
 
     news_count = process_company_news(
@@ -1022,7 +1190,8 @@ def main():
         f"PRICE: {price_count} | "
         f"MOMENTUM: {momentum_count} | "
         f"NEWS: {news_count} | "
-        f"WHALE: {whale_count}"
+        f"WHALE: {whale_count} | "
+        f"PRICE CHECKS: {PRICE_CHECK_COUNT}"
     )
 
 
