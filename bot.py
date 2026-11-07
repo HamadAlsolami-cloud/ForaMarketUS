@@ -1,78 +1,38 @@
-import os
-import re
-import json
-import time
-import hashlib
-import logging
-import requests
-import feedparser
 
+import os, re, json, time, hashlib, logging, requests, feedparser
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-
-# ==================================================
-# FORAS MARKET US
-# ==================================================
-
+# =============== SETTINGS ===============
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+API_KEY = os.getenv("FINNHUB_API_KEY")
 
 STATE_FILE = "alert_state.json"
+BASE = "https://finnhub.io/api/v1"
+YAHOO = "https://query1.finance.yahoo.com"
+HALT_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 
-FINNHUB_URL = "https://finnhub.io/api/v1"
-
-NASDAQ_HALT_URL = (
-    "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
-)
-
-YAHOO_SCREENER_URL = (
-    "https://query1.finance.yahoo.com/v1/finance/"
-    "screener/predefined/saved"
-)
-
-YAHOO_CHART_URL = (
-    "https://query1.finance.yahoo.com/v8/finance/chart/"
-)
-
-NY_TIMEZONE = ZoneInfo("America/New_York")
-
-
-# ==================================================
-# SETTINGS
-# ==================================================
-
-MAX_STOCK_PRICE = 5.00
-
-TOP_GAINERS_COUNT = 10
-
-MAX_SCAN_SYMBOLS = 20
-
-MAX_NEWS_SYMBOLS = 10
-
-# الحد الأقصى للتحقق من الأسعار في كل تشغيل
+MAX_PRICE = 5.00
+TOP_COUNT = 10
+MAX_SCAN = 20
+MAX_NEWS = 10
+MAX_SEC = 10
 MAX_PRICE_CHECKS = 45
 
-PRICE_CHANGE_LIMIT = 5.0
-
+PRICE_LIMIT = 5.0
 MOMENTUM_LIMIT = 2.5
 
-# Nasdaq / NYSE / NYSE American فقط
-ALLOWED_EXCHANGES = {
-    "NMS",
-    "NGM",
-    "NCM",
-    "NYQ",
-    "ASE"
+EXCHANGES = {"NMS", "NGM", "NCM", "NYQ", "ASE"}
+
+# النماذج ذات الأولوية
+SEC_FORMS = {
+    "8-K", "6-K", "S-1", "F-1", "S-3", "F-3",
+    "424B5", "SC 13D", "SC 13G", "3", "4", "5", "144"
 }
 
-# لا يوجد حالياً مصدر موثوق لبيانات Time & Sales وLevel 2
-WHALE_DATA_AVAILABLE = False
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 ForasMarketUS/5.0"
-}
+TZ = ZoneInfo("America/New_York")
+HEADERS = {"User-Agent": "Mozilla/5.0 ForasMarketUS/6.0"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,1118 +42,571 @@ logging.basicConfig(
 session = requests.Session()
 session.headers.update(HEADERS)
 
-# تخزين أسعار الأسهم خلال التشغيل الواحد
 PRICE_CACHE = {}
+PRICE_CHECKS = 0
 
-# عداد طلبات التحقق من الأسعار
-PRICE_CHECK_COUNT = 0
+# =============== TIME ===============
+def now():
+    return datetime.now(TZ)
 
+def time_text():
+    return now().strftime("%Y-%m-%d %I:%M:%S %p ET")
 
-# ==================================================
-# TIME
-# ==================================================
-
-def now_ny():
-    return datetime.now(NY_TIMEZONE)
-
-
-def ny_time_text():
-    return now_ny().strftime(
-        "%Y-%m-%d %I:%M:%S %p ET"
+def market_open():
+    n = now()
+    return n.weekday() < 5 and (
+        datetime.strptime("09:30", "%H:%M").time()
+        <= n.time()
+        < datetime.strptime("16:00", "%H:%M").time()
     )
 
+# =============== STATE ===============
+try:
+    with open(STATE_FILE, encoding="utf-8") as f:
+        state = json.load(f)
+    if not isinstance(state, dict):
+        state = {"sent": []}
+except Exception:
+    state = {"sent": []}
 
-def is_market_open():
-
-    now = now_ny()
-
-    if now.weekday() >= 5:
-        return False
-
-    current_time = now.time()
-
-    market_open = datetime.strptime(
-        "09:30", "%H:%M"
-    ).time()
-
-    market_close = datetime.strptime(
-        "16:00", "%H:%M"
-    ).time()
-
-    return market_open <= current_time < market_close
-
-
-# ==================================================
-# STATE / DUPLICATE PROTECTION
-# ==================================================
-
-def load_state():
-
-    try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
-
-            if isinstance(data, dict):
-                data.setdefault("sent", [])
-                return data
-
-    except Exception:
-        pass
-
-    return {"sent": []}
-
-
-state = load_state()
-
+state.setdefault("sent", [])
 
 def save_state():
-
+    state["sent"] = state["sent"][-5000:]
     try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f"State: {e}")
 
-        state["sent"] = state.get("sent", [])[-5000:]
+def alert_id(value):
+    return hashlib.sha256(str(value).encode()).hexdigest()
 
-        with open(
-            STATE_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
+def sent(key):
+    return key in state["sent"]
 
-            json.dump(
-                state,
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-    except Exception as error:
-
-        logging.error(
-            f"State save error: {error}"
-        )
-
-
-def make_id(value):
-
-    return hashlib.sha256(
-        str(value).encode("utf-8")
-    ).hexdigest()
-
-
-def already_sent(alert_id):
-
-    return alert_id in state.get("sent", [])
-
-
-def remember(alert_id):
-
-    state.setdefault("sent", []).append(alert_id)
+def remember(key):
+    state["sent"].append(key)
     save_state()
 
-
-# ==================================================
-# TELEGRAM
-# ==================================================
-
-def split_message(message, limit=3900):
-
-    if len(message) <= limit:
-        return [message]
-
-    chunks = []
-    current = ""
-
-    for paragraph in message.split("\n"):
-
-        addition = paragraph + "\n"
-
-        if len(current) + len(addition) > limit:
-
-            if current:
-                chunks.append(current.strip())
-
-            current = addition
-
-        else:
-            current += addition
-
-    if current:
-        chunks.append(current.strip())
-
-    return chunks
-
-
-def send_telegram(message):
-
+# =============== TELEGRAM ===============
+def send(message):
     if not TOKEN or not CHAT_ID:
-
-        logging.error(
-            "Telegram configuration missing."
-        )
-
+        logging.error("Telegram settings missing")
         return False
 
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TOKEN}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-    chunks = split_message(message)
+    chunks = []
+    while len(message) > 3900:
+        pos = message.rfind("\n", 0, 3900)
+        if pos < 1:
+            pos = 3900
+        chunks.append(message[:pos])
+        message = message[pos:].lstrip()
+
+    chunks.append(message)
 
     for chunk in chunks:
-
-        sent = False
-
         for attempt in range(5):
-
             try:
+                r = session.post(url, data={
+                    "chat_id": CHAT_ID,
+                    "text": chunk,
+                    "disable_web_page_preview": True
+                }, timeout=25)
 
-                response = session.post(
-                    url,
-                    data={
-                        "chat_id": CHAT_ID,
-                        "text": chunk,
-                        "disable_web_page_preview": True
-                    },
-                    timeout=25
-                )
-
-                if response.status_code == 429:
-
-                    try:
-
-                        wait_time = int(
-                            response.json()
-                            .get("parameters", {})
-                            .get("retry_after", 10)
-                        )
-
-                    except Exception:
-                        wait_time = 10
-
-                    time.sleep(wait_time + 1)
+                if r.status_code == 429:
+                    wait = r.json().get("parameters", {}).get("retry_after", 10)
+                    time.sleep(int(wait) + 1)
                     continue
 
-                response.raise_for_status()
+                r.raise_for_status()
+                if not r.json().get("ok"):
+                    return False
 
-                result = response.json()
+                time.sleep(1.2)
+                break
 
-                if result.get("ok"):
-
-                    sent = True
-                    time.sleep(1.2)
-                    break
-
-                logging.error(
-                    f"Telegram error: {result}"
-                )
-
-                return False
-
-            except Exception as error:
-
-                logging.error(
-                    f"Telegram sending error: {error}"
-                )
-
+            except Exception as e:
+                logging.warning(f"Telegram: {e}")
                 time.sleep(3)
-
-        if not sent:
+        else:
             return False
 
     return True
 
-
-# ==================================================
-# ARABIC TRANSLATION
-# ==================================================
-
-def translate_chunk(text):
-
-    try:
-
-        response = session.get(
-            "https://translate.googleapis.com/translate_a/single",
-            params={
-                "client": "gtx",
-                "sl": "auto",
-                "tl": "ar",
-                "dt": "t",
-                "q": text
-            },
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        return "".join(
-            part[0]
-            for part in data[0]
-            if part and part[0]
-        )
-
-    except Exception as error:
-
-        logging.warning(
-            f"Translation error: {error}"
-        )
-
-        return text
-
-
-def translate_arabic(text):
-
+# =============== TRANSLATION ===============
+def translate(text):
     if not text:
         return ""
 
-    chunks = [
-        text[index:index + 2500]
-        for index in range(0, len(text), 2500)
-    ]
+    output = []
+    for i in range(0, len(text), 2500):
+        try:
+            r = session.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={
+                    "client": "gtx", "sl": "auto",
+                    "tl": "ar", "dt": "t",
+                    "q": text[i:i + 2500]
+                }, timeout=20
+            )
+            r.raise_for_status()
+            output.append("".join(
+                p[0] for p in r.json()[0] if p and p[0]
+            ))
+        except Exception:
+            output.append(text[i:i + 2500])
 
-    translated_chunks = []
+    return "\n".join(output)
 
-    for chunk in chunks:
-
-        translated_chunks.append(
-            translate_chunk(chunk)
-        )
-
-        time.sleep(0.2)
-
-    return "\n".join(translated_chunks)
-
-
-# ==================================================
-# FINNHUB
-# ==================================================
-
-def finnhub_request(endpoint, params=None):
-
-    if not FINNHUB_API_KEY:
+# =============== FINNHUB ===============
+def finnhub(endpoint, params=None):
+    if not API_KEY:
         return None
-
-    request_params = dict(params or {})
-    request_params["token"] = FINNHUB_API_KEY
-
     try:
-
-        response = session.get(
-            f"{FINNHUB_URL}/{endpoint}",
-            params=request_params,
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
-    except Exception as error:
-
-        logging.warning(
-            f"Finnhub {endpoint} error: {error}"
-        )
-
+        p = dict(params or {})
+        p["token"] = API_KEY
+        r = session.get(f"{BASE}/{endpoint}", params=p, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logging.warning(f"Finnhub {endpoint}: {e}")
         return None
 
-
-# ==================================================
-# VERIFIED STOCK PRICE
-# ==================================================
-
-def get_stock_price(symbol):
-
-    global PRICE_CHECK_COUNT
+def price(symbol):
+    global PRICE_CHECKS
 
     symbol = symbol.upper()
-
     if symbol in PRICE_CACHE:
         return PRICE_CACHE[symbol]
 
-    if PRICE_CHECK_COUNT >= MAX_PRICE_CHECKS:
-
-        logging.warning(
-            "Maximum price checks reached."
-        )
-
+    if PRICE_CHECKS >= MAX_PRICE_CHECKS:
         return None
 
-    PRICE_CHECK_COUNT += 1
-
-    quote = finnhub_request(
-        "quote",
-        {"symbol": symbol}
-    )
-
-    if not isinstance(quote, dict):
-
-        PRICE_CACHE[symbol] = None
-        return None
+    PRICE_CHECKS += 1
+    q = finnhub("quote", {"symbol": symbol})
 
     try:
+        value = float(q["c"])
+        result = value if value > 0 else None
+    except (TypeError, ValueError, KeyError):
+        result = None
 
-        price = float(quote.get("c", 0))
+    PRICE_CACHE[symbol] = result
+    return result
 
-        if price > 0:
+def eligible(value):
+    return value is not None and 0 < value < MAX_PRICE
 
-            PRICE_CACHE[symbol] = price
+def money(value):
+    return f"${value:.4f}" if value else "غير متاح"
 
-            time.sleep(0.15)
+# =============== MARKET MOVERS ===============
+def market_movers():
+    candidates = {}
 
-            return price
+    for screener in ("day_gainers", "day_losers"):
+        try:
+            r = session.get(
+                f"{YAHOO}/v1/finance/screener/predefined/saved",
+                params={
+                    "formatted": "false",
+                    "scrIds": screener,
+                    "count": 100,
+                    "start": 0
+                }, timeout=25
+            )
+            r.raise_for_status()
 
-    except (ValueError, TypeError):
-        pass
+            quotes = r.json()["finance"]["result"][0]["quotes"]
 
-    PRICE_CACHE[symbol] = None
+            for x in quotes:
+                symbol = str(x.get("symbol", "")).upper()
+                exchange = str(x.get("exchange", "")).upper()
 
-    return None
+                if not symbol or exchange not in EXCHANGES:
+                    continue
+                if x.get("quoteType") != "EQUITY":
+                    continue
 
+                try:
+                    p = float(x.get("regularMarketPrice", 0))
+                    change = float(x.get("regularMarketChangePercent", 0))
+                except (ValueError, TypeError):
+                    continue
 
-def is_eligible_price(price):
+                if not eligible(p):
+                    continue
 
-    return (
-        price is not None
-        and 0 < price < MAX_STOCK_PRICE
+                candidates[symbol] = {
+                    "symbol": symbol,
+                    "change": change,
+                    "exchange": exchange
+                }
+
+        except Exception as e:
+            logging.warning(f"Yahoo {screener}: {e}")
+
+    # فحص الأقوى صعوداً وهبوطاً أولاً
+    ordered = sorted(
+        candidates.values(),
+        key=lambda x: abs(x["change"]),
+        reverse=True
     )
 
+    verified = []
+    for item in ordered:
+        if PRICE_CHECKS >= MAX_PRICE_CHECKS:
+            break
 
-def format_price(price):
+        p = price(item["symbol"])
+        if eligible(p):
+            item["price"] = p
+            verified.append(item)
 
-    if price is None:
-        return "غير متاح"
+    return sorted(verified, key=lambda x: x["change"], reverse=True)
 
-    return f"${price:.4f}"
+# =============== TOP GAINERS ===============
+def process_gainers(movers):
+    top = [x for x in movers if x["change"] > 0][:TOP_COUNT]
+    if not top:
+        return 0
 
-
-# ==================================================
-# YAHOO MARKET MOVERS
-# ==================================================
-
-def get_market_movers():
-
-    params = {
-        "formatted": "false",
-        "scrIds": "day_gainers",
-        "count": 100,
-        "start": 0
-    }
-
-    try:
-
-        response = session.get(
-            YAHOO_SCREENER_URL,
-            params=params,
-            timeout=25
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        results = (
-            data.get("finance", {})
-            .get("result", [])
-        )
-
-        if not results:
-            return []
-
-        quotes = results[0].get("quotes", [])
-
-        candidates = []
-
-        for item in quotes:
-
-            symbol = str(
-                item.get("symbol", "")
-            ).upper()
-
-            exchange = str(
-                item.get("exchange", "")
-            ).upper()
-
-            quote_type = str(
-                item.get("quoteType", "")
-            ).upper()
-
-            if not symbol:
-                continue
-
-            if exchange not in ALLOWED_EXCHANGES:
-                continue
-
-            if quote_type != "EQUITY":
-                continue
-
-            try:
-
-                yahoo_price = float(
-                    item.get("regularMarketPrice", 0)
-                )
-
-                change = float(
-                    item.get(
-                        "regularMarketChangePercent",
-                        0
-                    )
-                )
-
-            except (ValueError, TypeError):
-                continue
-
-            # استبعاد الأسهم التي لا تحقق الشرط
-            # حتى قبل طلب التحقق من Finnhub
-            if not is_eligible_price(yahoo_price):
-                continue
-
-            candidates.append({
-                "symbol": symbol,
-                "yahoo_price": yahoo_price,
-                "change": change,
-                "exchange": exchange
-            })
-
-        candidates.sort(
-            key=lambda item: item["change"],
-            reverse=True
-        )
-
-        verified_movers = []
-
-        # التحقق من السعر الحالي عبر Finnhub
-        for item in candidates:
-
-            if len(verified_movers) >= MAX_PRICE_CHECKS:
-                break
-
-            symbol = item["symbol"]
-
-            current_price = get_stock_price(symbol)
-
-            # لا إرسال دون سعر موثوق
-            if not is_eligible_price(current_price):
-                continue
-
-            verified_movers.append({
-                "symbol": symbol,
-                "price": current_price,
-                "change": item["change"],
-                "exchange": item["exchange"]
-            })
-
-        verified_movers.sort(
-            key=lambda item: item["change"],
-            reverse=True
-        )
-
-        logging.info(
-            f"Verified eligible stocks: "
-            f"{len(verified_movers)}"
-        )
-
-        return verified_movers
-
-    except Exception as error:
-
-        logging.error(
-            f"Yahoo market movers error: {error}"
-        )
-
-        return []
-
-
-# ==================================================
-# TOP GAINERS
-# ==================================================
-
-def process_top_gainers(movers):
-
-    eligible = [
-        item for item in movers
-        if is_eligible_price(item.get("price"))
+    lines = [
+        f"{i}. 🟢 {x['symbol']} {money(x['price'])} (+{x['change']:.2f}%)"
+        for i, x in enumerate(top, 1)
     ]
 
-    if not eligible:
-        logging.warning(
-            "No eligible stocks for top gainers."
-        )
+    key = alert_id("GAINERS|" + now().strftime("%Y-%m-%d-%H"))
+    if sent(key):
         return 0
 
-    top = eligible[:TOP_GAINERS_COUNT]
-
-    lines = []
-
-    for index, item in enumerate(top, start=1):
-
-        symbol = item["symbol"]
-        price = item["price"]
-        change = item["change"]
-
-        emoji = "🟢" if change >= 0 else "🔴"
-
-        lines.append(
-            f"{index}. {emoji} "
-            f"{symbol} ${price:.4f} "
-            f"({change:+.2f}%)"
-        )
-
-    message = (
+    msg = (
         "🏆 أعلى الأسهم الرابحة تحت 5 دولارات\n\n"
         + "\n".join(lines)
-        + f"\n\n🕒 {ny_time_text()}"
-        + "\nالمصدر: Yahoo Finance / Finnhub"
+        + f"\n\n🕒 {time_text()}\nالمصدر: Yahoo Finance / Finnhub"
     )
 
-    report_id = make_id(
-        "GAINERS|"
-        + now_ny().strftime("%Y-%m-%d-%H")
-    )
-
-    if already_sent(report_id):
-        return 0
-
-    if send_telegram(message):
-
-        remember(report_id)
+    if send(msg):
+        remember(key)
         return 1
-
     return 0
 
-
-# ==================================================
-# PRICE MOVEMENT
-# ==================================================
-
-def process_price_moves(movers):
-
+# =============== PRICE MOVES ===============
+def process_moves(movers):
     count = 0
+    today = now().strftime("%Y-%m-%d")
 
-    today = now_ny().strftime("%Y-%m-%d")
-
-    for item in movers[:MAX_SCAN_SYMBOLS]:
-
-        symbol = item["symbol"]
-        price = item["price"]
-        change = item["change"]
-
-        if not is_eligible_price(price):
+    for x in movers[:MAX_SCAN]:
+        change = x["change"]
+        if abs(change) < PRICE_LIMIT:
             continue
 
-        if abs(change) < PRICE_CHANGE_LIMIT:
-            continue
-
-        alert_id = make_id(
-            f"PRICE|{symbol}|{today}"
-        )
-
-        if already_sent(alert_id):
+        symbol = x["symbol"]
+        key = alert_id(f"PRICE|{symbol}|{today}")
+        if sent(key):
             continue
 
         emoji = "🚀" if change > 0 else "🔻"
-
-        message = (
-            f"{emoji} {symbol} ${price:.4f}\n\n"
-            f"التغير اليومي: {change:+.2f}%\n\n"
-            f"🕒 {ny_time_text()}\n"
-            "المصدر: Yahoo Finance / Finnhub"
+        msg = (
+            f"{emoji} {symbol} {money(x['price'])}\n\n"
+            f"التغير اليومي: {change:+.2f}%\n"
+            f"🕒 {time_text()}\nالمصدر: Yahoo Finance / Finnhub"
         )
 
-        if send_telegram(message):
-
-            remember(alert_id)
+        if send(msg):
+            remember(key)
             count += 1
 
     return count
 
-
-# ==================================================
-# INTRADAY PRICE MOMENTUM
-# ==================================================
-
-def get_intraday_candles(symbol):
-
+# =============== MOMENTUM ===============
+def candles(symbol):
     try:
-
-        response = session.get(
-            f"{YAHOO_CHART_URL}{symbol}",
-            params={
-                "range": "1d",
-                "interval": "5m",
-                "includePrePost": "false"
-            },
+        r = session.get(
+            f"{YAHOO}/v8/finance/chart/{symbol}",
+            params={"range": "1d", "interval": "5m"},
             timeout=20
         )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        result = (
-            data.get("chart", {})
-            .get("result", [])
-        )
-
-        if not result:
+        r.raise_for_status()
+        data = r.json()["chart"]["result"]
+        if not data:
             return []
-
-        quote_data = (
-            result[0]
-            .get("indicators", {})
-            .get("quote", [])
-        )
-
-        if not quote_data:
-            return []
-
-        closes = quote_data[0].get("close", [])
-
-        return [
-            float(value)
-            for value in closes
-            if value is not None
-        ]
-
-    except Exception as error:
-
-        logging.warning(
-            f"Intraday data error {symbol}: {error}"
-        )
-
+        values = data[0]["indicators"]["quote"][0]["close"]
+        return [float(v) for v in values if v is not None]
+    except Exception as e:
+        logging.warning(f"Candles {symbol}: {e}")
         return []
 
-
 def process_momentum(movers):
-
-    if not is_market_open():
+    if not market_open():
         return 0
 
     count = 0
+    today = now().strftime("%Y-%m-%d")
 
-    today = now_ny().strftime("%Y-%m-%d")
+    for x in movers[:MAX_SCAN]:
+        symbol = x["symbol"]
+        values = candles(symbol)
 
-    for item in movers[:MAX_SCAN_SYMBOLS]:
-
-        symbol = item["symbol"]
-        price = item["price"]
-
-        if not is_eligible_price(price):
+        if len(values) < 4:
             continue
 
-        closes = get_intraday_candles(symbol)
-
-        if len(closes) < 4:
+        recent = values[-4:]
+        if any(v <= 0 for v in recent):
             continue
 
-        recent = closes[-4:]
+        change = (recent[-1] / recent[0] - 1) * 100
+        rising = recent[-1] > recent[-2] > recent[-3]
+        falling = recent[-1] < recent[-2] < recent[-3]
 
-        if any(value <= 0 for value in recent):
+        if abs(change) < MOMENTUM_LIMIT or not (rising or falling):
             continue
 
-        move = (
-            (recent[-1] - recent[0])
-            / recent[0]
-        ) * 100
+        key = alert_id(f"MOMENTUM|{symbol}|{today}")
+        if sent(key):
+            continue
 
-        rising = (
-            recent[-1] > recent[-2] > recent[-3]
+        direction = "⚡ زخم صاعد" if rising else "🔻 زخم هابط"
+        msg = (
+            f"{direction}\n{symbol} {money(x['price'])}\n"
+            f"حركة آخر 15 دقيقة تقريباً: {change:+.2f}%\n"
+            f"🕒 {time_text()}\nالمصدر: Yahoo Finance"
         )
 
-        falling = (
-            recent[-1] < recent[-2] < recent[-3]
-        )
-
-        if abs(move) < MOMENTUM_LIMIT:
-            continue
-
-        if not rising and not falling:
-            continue
-
-        alert_id = make_id(
-            f"MOMENTUM|{symbol}|{today}"
-        )
-
-        if already_sent(alert_id):
-            continue
-
-        if rising:
-            emoji = "⚡"
-            direction = "زخم صاعد"
-        else:
-            emoji = "🔻"
-            direction = "زخم هابط"
-
-        message = (
-            f"{emoji} {symbol} ${price:.4f}\n\n"
-            f"{direction}\n"
-            f"حركة آخر 15 دقيقة تقريباً: {move:+.2f}%\n\n"
-            f"🕒 {ny_time_text()}\n"
-            "المصدر: Yahoo Finance - شموع 5 دقائق"
-        )
-
-        if send_telegram(message):
-
-            remember(alert_id)
+        if send(msg):
+            remember(key)
             count += 1
+
+        time.sleep(0.3)
+
+    return count
+
+# =============== COMPANY NEWS ===============
+def process_news(symbols):
+    count = 0
+    today = now().date()
+    start = today - timedelta(days=1)
+
+    for symbol in symbols[:MAX_NEWS]:
+        p = price(symbol)
+        if not eligible(p):
+            continue
+
+        articles = finnhub("company-news", {
+            "symbol": symbol,
+            "from": start.isoformat(),
+            "to": today.isoformat()
+        })
+
+        if not isinstance(articles, list):
+            continue
+
+        for a in articles[:3]:
+            headline = (a.get("headline") or "").strip()
+            summary = (a.get("summary") or "").strip()
+            link = a.get("url", "")
+
+            if not headline or not link:
+                continue
+
+            key = alert_id(f"NEWS|{symbol}|{link}")
+            if sent(key):
+                continue
+
+            translated = translate(headline + ("\n\n" + summary if summary else ""))
+
+            try:
+                article_time = datetime.fromtimestamp(
+                    int(a["datetime"]), ZoneInfo("UTC")
+                ).astimezone(TZ).strftime("%Y-%m-%d %I:%M %p ET")
+            except Exception:
+                article_time = "غير متاح"
+
+            msg = (
+                f"📰 {symbol} {money(p)}\n\n{translated}\n\n"
+                f"🔗 {link}\n🕒 {article_time}\n"
+                f"المصدر: {a.get('source', 'Finnhub')}"
+            )
+
+            if send(msg):
+                remember(key)
+                count += 1
 
         time.sleep(0.5)
 
     return count
 
+# =============== SEC FILINGS ===============
+def filing_label(form):
+    if form in {"S-1", "F-1", "S-3", "F-3", "424B5"}:
+        return "⚠️ تسجيل طرح أو إصدار أسهم - افحص احتمال التخفيف"
+    if form in {"SC 13D", "SC 13G"}:
+        return "👥 إفصاح ملكية مساهم كبير"
+    if form in {"3", "4", "5"}:
+        return "👔 إفصاح ملكية أو تداول مسؤول/مطلع"
+    if form == "144":
+        return "⚠️ إشعار بيع أسهم محتمل"
+    return "📌 إفصاح حدث جوهري"
 
-# ==================================================
-# COMPANY NEWS
-# ==================================================
-
-def process_company_news(symbols):
-
+def process_sec(symbols):
     count = 0
+    today = now().date()
+    start = today - timedelta(days=2)
 
-    today = now_ny().date()
-
-    from_date = today - timedelta(days=1)
-
-    for symbol in symbols[:MAX_NEWS_SYMBOLS]:
-
-        # التحقق من السعر قبل طلب الأخبار
-        price = get_stock_price(symbol)
-
-        if not is_eligible_price(price):
+    for symbol in symbols[:MAX_SEC]:
+        p = price(symbol)
+        if not eligible(p):
             continue
 
-        articles = finnhub_request(
-            "company-news",
-            {
-                "symbol": symbol,
-                "from": from_date.strftime("%Y-%m-%d"),
-                "to": today.strftime("%Y-%m-%d")
-            }
-        )
+        filings = finnhub("stock/filings", {
+            "symbol": symbol,
+            "from": start.isoformat(),
+            "to": today.isoformat()
+        })
 
-        if not isinstance(articles, list):
+        if not isinstance(filings, list):
             continue
 
-        for article in articles[:3]:
-
-            # إعادة التأكد من أهلية السعر
-            if not is_eligible_price(price):
+        for filing in filings:
+            form = str(filing.get("form", "")).upper().strip()
+            if form not in SEC_FORMS:
                 continue
 
-            headline = article.get(
-                "headline", ""
-            ).strip()
+            filed = filing.get("filedDate", "")
+            link = filing.get("filingUrl") or filing.get("reportUrl") or ""
 
-            summary = article.get(
-                "summary", ""
-            ).strip()
-
-            link = article.get("url", "")
-
-            source = article.get(
-                "source", "Finnhub"
-            )
-
-            timestamp = article.get(
-                "datetime", 0
-            )
-
-            if not headline or not link:
+            if not link:
                 continue
 
-            alert_id = make_id(
-                f"NEWS|{symbol}|{link}"
-            )
-
-            if already_sent(alert_id):
+            key = alert_id(f"SEC|{symbol}|{form}|{filed}|{link}")
+            if sent(key):
                 continue
 
-            # نعرض العنوان والملخص المتاحين من المصدر
-            # ولا ندعي أن الملخص هو المقال الكامل
-            full_text = headline
-
-            if summary:
-                full_text += "\n\n" + summary
-
-            arabic_text = translate_arabic(full_text)
-
-            article_time = "غير متاح"
-
-            if timestamp:
-
-                try:
-
-                    article_time = datetime.fromtimestamp(
-                        int(timestamp),
-                        tz=ZoneInfo("UTC")
-                    ).astimezone(
-                        NY_TIMEZONE
-                    ).strftime(
-                        "%Y-%m-%d %I:%M:%S %p ET"
-                    )
-
-                except Exception:
-                    pass
-
-            message = (
-                f"{symbol} {format_price(price)}\n\n"
-                f"{arabic_text}\n\n"
+            msg = (
+                f"📄 SEC | {symbol} {money(p)}\n\n"
+                f"النموذج: {form}\n"
+                f"{filing_label(form)}\n"
+                f"تاريخ الإيداع: {filed or 'غير متاح'}\n\n"
                 f"🔗 {link}\n"
-                f"🕒 {article_time}\n"
-                f"المصدر: {source}"
+                "المصدر: SEC / Finnhub\n"
+                "ملاحظة: التصنيف حسب نوع النموذج وليس توصية تداول."
             )
 
-            if send_telegram(message):
-
-                remember(alert_id)
+            if send(msg):
+                remember(key)
                 count += 1
 
-        time.sleep(1)
+        time.sleep(0.3)
 
     return count
 
-
-# ==================================================
-# HALT ONLY - NO RESUME
-# ==================================================
-
-def extract_halt_symbol(text):
-
+# =============== HALT ONLY ===============
+def halt_symbol(text):
     patterns = [
         r"SECURITY\s+([A-Z][A-Z0-9.$-]{0,9})\s+HALTED",
-
-        r"(?:SYMBOL|TICKER|ISSUE SYMBOL)\s*[:\-]\s*"
-        r"([A-Z][A-Z0-9.$-]{0,9})",
-
+        r"(?:SYMBOL|TICKER|ISSUE SYMBOL)\s*[:\-]\s*([A-Z][A-Z0-9.$-]{0,9})",
         r"\b([A-Z]{1,5})\s+HALTED\b",
-
         r"\(([A-Z]{1,5})\)"
     ]
 
     for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
-
-        if match:
-            return match.group(1).upper()
-
-    return "غير محدد"
-
+        m = re.search(pattern, text, re.I)
+        if m:
+            return m.group(1).upper()
+    return None
 
 def process_halts():
-
-    if not is_market_open():
-
-        logging.info(
-            "Outside regular market hours. HALT skipped."
-        )
-
+    if not market_open():
         return 0
 
     try:
-
-        response = session.get(
-            NASDAQ_HALT_URL,
-            timeout=25
-        )
-
-        response.raise_for_status()
-
-        feed = feedparser.parse(response.content)
-
-    except Exception as error:
-
-        logging.error(
-            f"Nasdaq halt feed error: {error}"
-        )
-
+        r = session.get(HALT_URL, timeout=25)
+        r.raise_for_status()
+        feed = feedparser.parse(r.content)
+    except Exception as e:
+        logging.error(f"HALT feed: {e}")
         return 0
 
     count = 0
-
     for item in feed.entries:
-
         title = item.get("title", "")
-        summary = item.get("summary", "")
-        description = item.get("description", "")
+        text = f"{title} {item.get('summary', '')} {item.get('description', '')}"
+        upper = text.upper()
+
+        if re.search(r"\b(RESUMED|RESUME|RESUMPTION|TRADING RESUMES)\b", upper):
+            continue
+        if not re.search(r"\bHALTED\b|\bHALT\b", upper):
+            continue
+
+        symbol = halt_symbol(text)
+        if not symbol:
+            continue
+
+        p = price(symbol)
+        if not eligible(p):
+            continue
+
         link = item.get("link", "")
+        key = alert_id(f"HALT|{symbol}|{link}|{title}")
+        if sent(key):
+            continue
 
-        full_text = (
-            f"{title} {summary} {description}"
+        msg = (
+            f"🔴 HALT | {symbol} {money(p)}\n\n"
+            f"إيقاف تداول\n{title}\n\n"
+            f"🔗 {link}\n🕒 {time_text()}\nالمصدر: Nasdaq Trader"
         )
 
-        upper_text = full_text.upper()
-
-        # تجاهل الاستئناف نهائياً
-        if re.search(
-            r"\b(RESUMED|RESUME|RESUMPTION|TRADING RESUMES)\b",
-            upper_text
-        ):
-            continue
-
-        if not re.search(
-            r"\bHALTED\b|\bHALT\b",
-            upper_text
-        ):
-            continue
-
-        symbol = extract_halt_symbol(full_text)
-
-        # لا نرسل حدثاً إذا لم نستطع تحديد الرمز
-        if symbol == "غير محدد":
-            continue
-
-        price = get_stock_price(symbol)
-
-        # شرط السعر إلزامي في HALT أيضاً
-        if not is_eligible_price(price):
-            continue
-
-        alert_id = make_id(
-            f"HALT|{symbol}|{full_text}|{link}"
-        )
-
-        if already_sent(alert_id):
-            continue
-
-        message = (
-            f"🔴 {symbol} {format_price(price)}\n\n"
-            "HALT - إيقاف تداول\n\n"
-            f"{title}\n\n"
-            f"🔗 {link}\n"
-            f"🕒 {ny_time_text()}\n"
-            "المصدر: Nasdaq Trader"
-        )
-
-        if send_telegram(message):
-
-            remember(alert_id)
+        if send(msg):
+            remember(key)
             count += 1
 
     return count
 
-
-# ==================================================
-# WHALE ALERT
-# ==================================================
-
-def process_whale_alerts():
-
-    # لا نعتبر ارتفاع الحجم وحده صفقة حوت.
-    # لا نعتبر عرض NBBO صفقة منفذة.
-    # يلزم مصدر Time & Sales موثوق للصفقات المنفذة.
-    # ويلزم Level 2 لرصد الأوامر المعروضة.
-
-    if not WHALE_DATA_AVAILABLE:
-
-        logging.info(
-            "WHALE disabled: verified trade/order-book "
-            "data source is not configured."
-        )
-
-        return 0
-
+# =============== WHALES ===============
+def process_whales():
+    # لا يتم اعتبار الحجم المرتفع صفقة حوت.
+    # لا تفعيل قبل توفير بيانات Time & Sales وLevel 2 موثوقة.
+    logging.info("WHale disabled: verified trade/order-book feed unavailable")
     return 0
 
-
-# ==================================================
-# MAIN
-# ==================================================
-
+# =============== MAIN ===============
 def main():
+    global PRICE_CACHE, PRICE_CHECKS
+    PRICE_CACHE, PRICE_CHECKS = {}, 0
 
-    global PRICE_CACHE
-    global PRICE_CHECK_COUNT
+    logging.info("Foras Market US started")
 
-    # إعادة تهيئة التخزين عند كل تشغيل
-    PRICE_CACHE = {}
-    PRICE_CHECK_COUNT = 0
-
-    logging.info(
-        "Foras Market US scan started"
-    )
-
-    logging.info(
-        f"Maximum stock price: ${MAX_STOCK_PRICE:.2f}"
-    )
-
-    if not TOKEN or not CHAT_ID:
-
-        logging.error(
-            "Telegram configuration incomplete."
-        )
-
+    if not TOKEN or not CHAT_ID or not API_KEY:
+        logging.error("Missing Telegram or Finnhub settings")
         return
 
-    if not FINNHUB_API_KEY:
-
-        logging.error(
-            "Finnhub API key missing."
-        )
-
-        return
-
-    # 1 - HALT
     halt_count = process_halts()
-
-    # 2 - Market movers
-    movers = get_market_movers()
+    movers = market_movers()
 
     if not movers:
-
-        logging.warning(
-            "No verified stocks under $5 returned."
-        )
-
+        logging.warning("No verified eligible stocks")
         save_state()
         return
 
-    # 3 - Top gainers
-    gainers_count = process_top_gainers(movers)
+    gainers = process_gainers(movers)
+    moves = process_moves(movers)
+    momentum = process_momentum(movers)
 
-    # 4 - Price movement
-    price_count = process_price_moves(movers)
-
-    # 5 - Strong momentum
-    momentum_count = process_momentum(movers)
-
-    # 6 - Company-specific news
-    news_symbols = [
-        item["symbol"]
-        for item in movers[:MAX_NEWS_SYMBOLS]
-        if is_eligible_price(item["price"])
-    ]
-
-    news_count = process_company_news(
-        news_symbols
-    )
-
-    # 7 - Whale
-    whale_count = process_whale_alerts()
+    symbols = [x["symbol"] for x in movers if eligible(x["price"])]
+    news = process_news(symbols)
+    sec = process_sec(symbols)
+    whales = process_whales()
 
     save_state()
-
     logging.info(
-        "Scan completed | "
-        f"HALT: {halt_count} | "
-        f"GAINERS: {gainers_count} | "
-        f"PRICE: {price_count} | "
-        f"MOMENTUM: {momentum_count} | "
-        f"NEWS: {news_count} | "
-        f"WHALE: {whale_count} | "
-        f"PRICE CHECKS: {PRICE_CHECK_COUNT}"
+        f"Done | HALT:{halt_count} | GAINERS:{gainers} | "
+        f"PRICE:{moves} | MOMENTUM:{momentum} | NEWS:{news} | "
+        f"SEC:{sec} | WHALES:{whales} | PRICE CHECKS:{PRICE_CHECKS}"
     )
-
 
 if __name__ == "__main__":
     main()
