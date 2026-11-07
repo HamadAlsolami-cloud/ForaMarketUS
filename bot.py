@@ -26,6 +26,7 @@ MAX_HALT_PRICE_CHECKS = 20
 PRICE_LIMIT = 5.0
 MOMENTUM_LIMIT = 2.5
 
+# Nasdaq + NYSE + NYSE American
 EXCHANGES = {"NMS", "NGM", "NCM", "NYQ", "ASE"}
 
 SEC_FORMS = {
@@ -224,7 +225,6 @@ def money(value):
     return f"${value:.4f}" if value else "غير متاح"
 
 # =============== MARKET MOVERS ===============
-
 def market_movers():
     candidates = {}
 
@@ -238,34 +238,92 @@ def market_movers():
 
     samples = []
 
-    for screener in ("day_gainers", "day_losers"):
+    # Yahoo Custom Screener
+    # بدلاً من day_gainers و day_losers
+    # اللتين تفرضان سعراً أدنى قدره 5 دولارات.
+
+    url = f"{YAHOO}/v1/finance/screener"
+
+    query = {
+        "operator": "and",
+        "operands": [
+            {
+                "operator": "eq",
+                "operands": ["region", "us"]
+            },
+            {
+                "operator": "lt",
+                "operands": ["intradayprice", MAX_PRICE]
+            },
+            {
+                "operator": "is-in",
+                "operands": [
+                    "exchange",
+                    "NMS", "NGM", "NCM", "NYQ", "ASE"
+                ]
+            }
+        ]
+    }
+
+    # أربع دفعات، كل دفعة 250 سهماً
+    for offset in (0, 250, 500, 750):
         try:
-            r = session.get(
-                f"{YAHOO}/v1/finance/screener/predefined/saved",
+            payload = {
+                "offset": offset,
+                "size": 250,
+                "sortField": "dayvolume",
+                "sortType": "DESC",
+                "quoteType": "EQUITY",
+                "query": query
+            }
+
+            r = session.post(
+                url,
                 params={
+                    "corsDomain": "finance.yahoo.com",
                     "formatted": "false",
-                    "scrIds": screener,
-                    "count": 100,
-                    "start": 0
+                    "lang": "en-US",
+                    "region": "US"
                 },
-                timeout=25
+                json=payload,
+                timeout=30
             )
+
             r.raise_for_status()
 
-            data = r.json().get("finance", {}).get("result") or []
+            data = (
+                r.json()
+                .get("finance", {})
+                .get("result") or []
+            )
+
             if not data:
-                logging.warning(f"Yahoo {screener}: empty result")
-                continue
+                logging.warning(
+                    f"Yahoo custom screener empty at offset {offset}"
+                )
+                break
 
             quotes = data[0].get("quotes", [])
+
+            if not quotes:
+                break
+
             stats["received"] += len(quotes)
 
             for x in quotes:
-                symbol = str(x.get("symbol", "")).upper()
-                exchange = str(x.get("exchange", "")).upper()
-                quote_type = str(x.get("quoteType", "")).upper()
+                symbol = str(
+                    x.get("symbol", "")
+                ).upper()
 
-                if len(samples) < 8:
+                exchange = str(
+                    x.get("exchange", "")
+                ).upper()
+
+                quote_type = str(
+                    x.get("quoteType", "")
+                ).upper()
+
+                if len(samples) < 10:
                     samples.append({
                         "symbol": symbol,
                         "exchange": exchange,
@@ -275,14 +333,18 @@ def market_movers():
 
                 if exchange not in EXCHANGES:
                     continue
+
                 stats["exchange"] += 1
 
                 if quote_type != "EQUITY":
                     continue
+
                 stats["equity"] += 1
 
                 try:
-                    p = float(x.get("regularMarketPrice", 0))
+                    p = float(
+                        x.get("regularMarketPrice", 0)
+                    )
                     change = float(
                         x.get("regularMarketChangePercent", 0)
                     )
@@ -291,24 +353,38 @@ def market_movers():
 
                 if p <= 0:
                     continue
+
                 stats["valid_price"] += 1
 
                 if not eligible(p):
                     continue
+
                 stats["under_5"] += 1
 
                 candidates[symbol] = {
                     "symbol": symbol,
                     "change": change,
-                    "exchange": exchange
+                    "exchange": exchange,
+                    "volume": int(
+                        x.get("regularMarketVolume") or 0
+                    )
                 }
 
         except Exception as e:
-            logging.warning(f"Yahoo {screener}: {e}")
+            logging.warning(
+                f"Yahoo custom screener offset {offset}: {e}"
+            )
+            break
 
-    logging.info(f"YAHOO FILTER STATS: {stats}")
-    logging.info(f"YAHOO SAMPLE: {samples}")
+    logging.info(
+        f"YAHOO CUSTOM FILTER STATS: {stats}"
+    )
 
+    logging.info(
+        f"YAHOO CUSTOM SAMPLE: {samples}"
+    )
+
+    # ترتيب المرشحين حسب أكبر حركة يومية
     ordered = sorted(
         candidates.values(),
         key=lambda x: abs(x["change"]),
@@ -317,6 +393,7 @@ def market_movers():
 
     verified = []
 
+    # التحقق النهائي من السعر عبر Finnhub
     for item in ordered:
         if PRICE_CHECKS >= MAX_PRICE_CHECKS:
             break
