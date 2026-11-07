@@ -497,34 +497,115 @@ def market_movers():
     )
 
 
+# =============== TOP GAINERS REASONS ===============
+def parse_finnhub_time(value):
+    try:
+        return datetime.fromtimestamp(int(value), ZoneInfo("UTC")).astimezone(TZ)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def gainer_reason(symbol):
+    """إرجاع سبب مدعوم بمصدر حديث؛ لا نخمن سبب الحركة."""
+    today = now().date()
+    yesterday = today - timedelta(days=1)
+    news_items = finnhub("company-news", {
+        "symbol": symbol,
+        "from": yesterday.isoformat(),
+        "to": today.isoformat()
+    })
+    filings = finnhub("stock/filings", {
+        "symbol": symbol,
+        "from": yesterday.isoformat(),
+        "to": today.isoformat()
+    })
+
+    candidates = []
+
+    if isinstance(news_items, list):
+        for article in news_items:
+            headline = (article.get("headline") or "").strip()
+            link = (article.get("url") or "").strip()
+            published = parse_finnhub_time(article.get("datetime"))
+            if not headline or not link or not published:
+                continue
+            # نقبل الخبر المنشور اليوم بتوقيت نيويورك فقط.
+            if published.date() != today:
+                continue
+            candidates.append((published, "news", headline, link))
+
+    if isinstance(filings, list):
+        for filing in filings:
+            form = str(filing.get("form", "")).upper().strip()
+            if form not in SEC_FORMS:
+                continue
+            filed_text = str(filing.get("filedDate") or "").strip()
+            try:
+                filed_date = datetime.strptime(filed_text[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if filed_date != today:
+                continue
+            link = (filing.get("filingUrl") or filing.get("reportUrl") or "").strip()
+            if not link:
+                continue
+            # تاريخ الإيداع موثق، لكن لا نفترض أن الإيداع سبب الارتفاع وحده.
+            filed_dt = datetime.combine(filed_date, datetime.min.time(), tzinfo=TZ)
+            candidates.append((filed_dt, "sec", form, link))
+
+    if not candidates:
+        return "⚪ بدون سبب معلن"
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, kind, detail, link = candidates[0]
+
+    if kind == "news":
+        short = translate(detail)
+        short = re.sub(r"\s+", " ", short).strip()
+        if len(short) > 115:
+            short = short[:112].rstrip() + "..."
+        return f"📰 خبر متزامن: {short} | {link}"
+
+    return f"📄 نموذج SEC {detail} (إيداع اليوم) | {link}"
+
+
 # =============== TOP GAINERS ===============
 def process_gainers():
-    # لا يوجد أي شرط MAX_PRICE في هذا القسم.
+    # هذا القسم وحده لا يطبق شرط MAX_PRICE.
     top = TOP_GAINERS_DATA[:TOP_COUNT]
 
     if not top:
         logging.warning("TOP GAINERS: no Nasdaq gainers returned")
         return 0
 
-    lines = [
-        f"{i}. 🟢 {x['symbol']} {money(x['price'])} "
-        f"(+{x['change']:.2f}%)"
-        for i, x in enumerate(top, 1)
-    ]
-
-    key = alert_id(
-        "GAINERS|" + now().strftime("%Y-%m-%d-%H")
-    )
-
+    key = alert_id("GAINERS|" + now().strftime("%Y-%m-%d-%H"))
     if sent(key):
         return 0
 
+    # جدول نصي بأربعة أعمدة؛ روابط المصادر تبقى قابلة للنقر في Telegram.
+    rows = [
+        "الاسم | السعر | النسبة | سبب الارتفاع",
+        "--- | ---: | ---: | ---"
+    ]
+
+    for item in top:
+        symbol = item["symbol"]
+        reason = gainer_reason(symbol)
+        display_name = (item.get("name") or "").strip()
+        stock_name = f"{display_name} ({symbol})" if display_name else symbol
+        rows.append(
+            f"{stock_name} | {money(item['price'])} | "
+            f"+{item['change']:.2f}% | {reason}"
+        )
+        time.sleep(0.25)
+
     msg = (
-        "🏆 أعلى 10 أسهم ارتفاعاً\n\n"
-        + "\n".join(lines)
+        "🏆 أكثر 10 أسهم ارتفاعاً\n\n"
+        + "\n".join(rows)
         + f"\n\n🕒 {time_text()}\n"
-        "المصدر: Nasdaq Screener\n"
-        "تنبيه: هذا القسم لا يطبق حد السعر الأقل من 5 دولارات."
+        "المصدر: Nasdaq Screener / Finnhub / SEC\n"
+        "ملاحظة: الخبر أو الإيداع متزامن وموثق، ولا يعني بالضرورة أنه السبب المؤكد للارتفاع. "
+        "هذا القسم وحده لا يطبق حد السعر الأقل من 5 دولارات."
     )
 
     if send(msg):
