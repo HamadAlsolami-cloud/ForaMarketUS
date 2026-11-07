@@ -578,7 +578,11 @@ def process_gainers():
         logging.warning("TOP GAINERS: no Nasdaq gainers returned")
         return 0
 
-    key = alert_id("GAINERS|" + now().strftime("%Y-%m-%d-%H"))
+    # السماح برسالة واحدة في كل فترة ربع ساعة (00، 15، 30، 45).
+    current_time = now()
+    quarter_hour = (current_time.minute // 15) * 15
+    bucket = current_time.replace(minute=quarter_hour, second=0, microsecond=0)
+    key = alert_id("GAINERS|" + bucket.strftime("%Y-%m-%d-%H-%M"))
     if sent(key):
         return 0
 
