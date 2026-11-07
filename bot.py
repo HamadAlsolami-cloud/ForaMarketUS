@@ -6,6 +6,7 @@ import hashlib
 import logging
 import requests
 import feedparser
+from collections import deque
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -26,12 +27,22 @@ MAX_SCAN = 20
 MAX_NEWS = 10
 MAX_SEC = 10
 
+# فلاتر قائمة أعلى الرابحين (تنظيف الحركات الوهمية)
+MIN_GAINER_PRICE = 0.50
+MIN_GAINER_VOLUME = 100_000
+
 # عدادات مستقلة
 MAX_PRICE_CHECKS = 45
 MAX_HALT_PRICE_CHECKS = 20
 
+# حد Finnhub المجاني 60 طلب/دقيقة؛ نترك هامش أمان
+FINNHUB_PER_MIN = 50
+
 PRICE_LIMIT = 5.0
 MOMENTUM_LIMIT = 2.5
+
+# أقصى عدد صفحات يتم جلبها من فاحص Nasdaq لكل بورصة
+MAX_SCREENER_PAGES = 10
 
 # NASDAQ / NYSE / NYSE American فقط. لا يتم طلب OTC.
 NASDAQ_EXCHANGES = ("NASDAQ", "NYSE", "AMEX")
@@ -62,6 +73,7 @@ session.headers.update(HEADERS)
 PRICE_CACHE = {}
 PRICE_CHECKS = 0
 HALT_PRICE_CHECKS = 0
+FINNHUB_CALLS = deque()
 
 # قائمة أعلى الرابحين مستقلة عن قائمة الأسهم تحت 5 دولارات
 TOP_GAINERS_DATA = []
@@ -76,13 +88,42 @@ def time_text():
     return now().strftime("%Y-%m-%d %I:%M:%S %p ET")
 
 
-def market_open():
+def _t(s):
+    return datetime.strptime(s, "%H:%M").time()
+
+
+def session_name():
+    """pre / regular / after / None (مغلق أو عطلة نهاية أسبوع)."""
     n = now()
-    return n.weekday() < 5 and (
-        datetime.strptime("09:30", "%H:%M").time()
-        <= n.time()
-        < datetime.strptime("16:00", "%H:%M").time()
-    )
+    if n.weekday() >= 5:
+        return None
+
+    t = n.time()
+    if _t("04:00") <= t < _t("09:30"):
+        return "pre"
+    if _t("09:30") <= t < _t("16:00"):
+        return "regular"
+    if _t("16:00") <= t < _t("20:00"):
+        return "after"
+    return None
+
+
+SESSION_TITLES = {
+    "pre": "🌅 رابحو ما قبل الافتتاح",
+    "regular": "🏆 أكثر 10 أسهم ارتفاعاً",
+    "after": "🌙 رابحو ما بعد الإغلاق",
+}
+
+
+def reason_window_start():
+    """بداية نافذة البحث عن الأخبار: إغلاق آخر يوم تداول قبل يوم التداول الحالي."""
+    d = now().date()
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return datetime.combine(d, _t("16:00"), tzinfo=TZ)
 
 
 # =============== STATE ===============
@@ -201,25 +242,49 @@ def translate(text):
 
 
 # =============== FINNHUB ===============
+def finnhub_throttle():
+    """منع تجاوز حد الطلبات: لا أكثر من FINNHUB_PER_MIN طلب كل 60 ثانية."""
+    while True:
+        t = time.time()
+        while FINNHUB_CALLS and t - FINNHUB_CALLS[0] > 60:
+            FINNHUB_CALLS.popleft()
+
+        if len(FINNHUB_CALLS) < FINNHUB_PER_MIN:
+            FINNHUB_CALLS.append(t)
+            return
+
+        time.sleep(max(0.5, 60 - (t - FINNHUB_CALLS[0]) + 0.2))
+
+
 def finnhub(endpoint, params=None):
     if not API_KEY:
         return None
 
-    try:
-        p = dict(params or {})
-        p["token"] = API_KEY
+    p = dict(params or {})
+    p["token"] = API_KEY
 
-        r = session.get(
-            f"{BASE}/{endpoint}",
-            params=p,
-            timeout=20
-        )
-        r.raise_for_status()
-        return r.json()
+    for attempt in range(2):
+        try:
+            finnhub_throttle()
+            r = session.get(
+                f"{BASE}/{endpoint}",
+                params=p,
+                timeout=20
+            )
 
-    except Exception as e:
-        logging.warning(f"Finnhub {endpoint}: {e}")
-        return None
+            if r.status_code == 429 and attempt == 0:
+                logging.warning(f"Finnhub {endpoint}: rate limited, waiting")
+                time.sleep(12)
+                continue
+
+            r.raise_for_status()
+            return r.json()
+
+        except Exception as e:
+            logging.warning(f"Finnhub {endpoint}: {e}")
+            return None
+
+    return None
 
 
 def price(symbol, purpose="general"):
@@ -261,6 +326,20 @@ def money(value):
     return f"${value:.4f}" if value else "غير متاح"
 
 
+def short_money(value):
+    if not value:
+        return "غير متاح"
+    return f"${value:.2f}" if value >= 1 else f"${value:.4f}"
+
+
+def fmt_volume(v):
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.0f}K"
+    return str(v)
+
+
 # =============== NASDAQ SCREENER HELPERS ===============
 def parse_number(value):
     """تحويل قيم Nasdaq النصية مثل $1.25 و +12.5% و 1,200 إلى أرقام."""
@@ -287,19 +366,41 @@ def parse_number(value):
         return None
 
 
-def is_common_equity(row):
-    """استبعاد ETF/ETN والوحدات والضمانات والأسهم الممتازة والسندات."""
-    name = str(row.get("name") or row.get("securityName") or "").lower()
-    exclusions = (
-        " etf", " etn", " exchange traded fund", " exchange-traded fund",
-        " warrant", " warrants", " unit", " units", " preferred",
-        " depositary share", " depositary shares", " bond", " notes",
-        " right", " rights", " debenture"
-    )
-    return not any(term in name for term in exclusions)
+# استبعاد الأدوات غير العادية بحسب الاسم (كلمات كاملة فقط)
+NAME_EXCLUDE = re.compile(
+    r"\b(etf|etn|warrants?|depositary|debentures?|senior notes?|"
+    r"exchange[- ]traded)\b"
+    r"|\bpreferred (stock|shares|securities)\b"
+    r"|\bunits?,? each\b|\bunits?$|\brights?$",
+    re.I
+)
+
+# لواحق الرموز: warrant / unit / right
+SYMBOL_EXCLUDE = re.compile(r"[.\-](WS|WT|W|U|UN|RT|R)$")
+
+
+def is_common_equity(symbol, name):
+    """فلتر أدق: يعتمد على لاحقة الرمز وكلمات الاسم الكاملة."""
+    if "$" in symbol or "^" in symbol:
+        return False
+
+    # رموز Nasdaq الخماسية: W = warrant, U = unit, R = right
+    if len(symbol) == 5 and symbol[-1] in {"W", "U", "R"}:
+        return False
+
+    if SYMBOL_EXCLUDE.search(symbol):
+        return False
+
+    if NAME_EXCLUDE.search(str(name or "")):
+        return False
+
+    return True
 
 
 def normalize_nasdaq_row(row, requested_exchange):
+    if not isinstance(row, dict):
+        return None
+
     symbol = str(row.get("symbol") or "").strip().upper()
     if not symbol or len(symbol) > 15:
         return None
@@ -322,9 +423,9 @@ def normalize_nasdaq_row(row, requested_exchange):
     if last is None or last <= 0 or pct is None:
         return None
 
-    name = row.get("name") or row.get("securityName") or ""
+    name = str(row.get("name") or row.get("securityName") or "")
 
-    if not is_common_equity(row):
+    if not is_common_equity(symbol, name):
         return None
 
     return {
@@ -333,43 +434,44 @@ def normalize_nasdaq_row(row, requested_exchange):
         "change": pct,
         "exchange": requested_exchange,
         "volume": int(parse_number(row.get("volume")) or 0),
-        "name": str(name)
+        "name": name
     }
 
 
 def fetch_nasdaq_exchange(exchange):
     """
-    واجهة Nasdaq العامة المستخدمة في صفحة الفاحص.
-    هذه الواجهة عامة لكنها غير موثقة كواجهة مستقرة، لذلك يوجد تحقق دفاعي.
+    جلب كل صفحات الفاحص لبورصة واحدة عبر offset.
+    الواجهة غير موثقة؛ لذلك يوجد كشف لتجاهل offset وحد أقصى للصفحات.
     """
     rows = []
     offset = 0
     limit = 5000
+    last_first = None
 
-    try:
-        # واجهة Nasdaq العامة تستخدم غالباً data.table.rows،
-        # وقد تختلف الاستجابة بين tableonly=true/false؛ لذلك ندعم الشكلين.
-        exchange_param = exchange.lower()
-
-        r = session.get(
-            NASDAQ_API,
-            params={
-                "tableonly": "false",
-                "limit": limit,
-                "offset": offset,
-                "exchange": exchange_param,
-                "download": "true"
-            },
-            headers={
-                "User-Agent": HEADERS["User-Agent"],
-                "Accept": "application/json, text/plain, */*",
-                "Origin": "https://www.nasdaq.com",
-                "Referer": "https://www.nasdaq.com/market-activity/stocks/screener"
-            },
-            timeout=35
-        )
-        r.raise_for_status()
-        payload = r.json()
+    for page in range(MAX_SCREENER_PAGES):
+        try:
+            r = session.get(
+                NASDAQ_API,
+                params={
+                    "tableonly": "false",
+                    "limit": limit,
+                    "offset": offset,
+                    "exchange": exchange.lower(),
+                    "download": "true"
+                },
+                headers={
+                    "User-Agent": HEADERS["User-Agent"],
+                    "Accept": "application/json, text/plain, */*",
+                    "Origin": "https://www.nasdaq.com",
+                    "Referer": "https://www.nasdaq.com/market-activity/stocks/screener"
+                },
+                timeout=35
+            )
+            r.raise_for_status()
+            payload = r.json()
+        except Exception as e:
+            logging.warning(f"Nasdaq screener {exchange} page {page}: {e}")
+            break
 
         data = payload.get("data") or {}
         table = data.get("table") or {}
@@ -380,40 +482,35 @@ def fetch_nasdaq_exchange(exchange):
             or []
         )
 
-        if not isinstance(page_rows, list):
-            logging.warning(
-                f"Nasdaq {exchange}: unexpected rows format; "
-                f"data keys={list(data.keys())}"
-            )
-            return []
+        if not isinstance(page_rows, list) or not page_rows:
+            if page == 0:
+                logging.warning(
+                    f"Nasdaq {exchange}: zero rows. "
+                    f"top_keys={list(payload.keys())}; "
+                    f"data_keys={list(data.keys())}"
+                )
+            break
+
+        # لو الواجهة تتجاهل offset تعود نفس الصفحة: نتوقف
+        first = page_rows[0].get("symbol") if isinstance(page_rows[0], dict) else None
+        if first is not None and first == last_first:
+            break
+        last_first = first
 
         rows.extend(page_rows)
+        offset += len(page_rows)
 
         total = parse_number(
             data.get("totalrecords")
             or table.get("totalrecords")
         )
-        if total and total > limit:
-            logging.warning(
-                f"Nasdaq {exchange}: returned {len(page_rows)} of "
-                f"{int(total)} rows; only first page is loaded"
-            )
 
-        if not page_rows:
-            logging.warning(
-                f"Nasdaq {exchange}: zero rows. "
-                f"HTTP={r.status_code}; top_keys={list(payload.keys())}; "
-                f"data_keys={list(data.keys())}; "
-                f"table_keys={list(table.keys()) if isinstance(table, dict) else 'N/A'}"
-            )
+        if len(page_rows) < limit or (total and offset >= total):
+            break
 
-        logging.info(
-            f"NASDAQ SCREENER {exchange}: received {len(page_rows)} rows"
-        )
+        time.sleep(0.5)
 
-    except Exception as e:
-        logging.warning(f"Nasdaq screener {exchange}: {e}")
-
+    logging.info(f"NASDAQ SCREENER {exchange}: received {len(rows)} rows")
     return rows
 
 
@@ -425,6 +522,7 @@ def market_movers():
     stats = {
         "received": 0,
         "valid_equity": 0,
+        "gainers_after_filters": 0,
         "under_5": 0,
         "verified_under_5": 0
     }
@@ -441,13 +539,15 @@ def market_movers():
             stats["valid_equity"] += 1
             all_rows[item["symbol"]] = item
 
-    # أعلى 10 رابحين لا يخضعون لشرط 5 دولارات.
-    # الأسعار ونسب التغير مأخوذة مباشرة من بيانات فاحص Nasdaq.
+    # أعلى الرابحين: لا يخضعون لشرط 5 دولارات، لكن بفلتر سعر وحجم أدنى.
     gainers = [
         dict(x) for x in all_rows.values()
-        if x["change"] > 0 and x["price"] > 0
+        if x["change"] > 0
+        and x["price"] >= MIN_GAINER_PRICE
+        and x["volume"] >= MIN_GAINER_VOLUME
     ]
     gainers.sort(key=lambda x: x["change"], reverse=True)
+    stats["gainers_after_filters"] = len(gainers)
     TOP_GAINERS_DATA = gainers[:TOP_COUNT]
 
     # بقية التنبيهات: أقل من 5 دولارات فقط، ثم تحقق إضافي من Finnhub.
@@ -480,6 +580,7 @@ def market_movers():
                 "symbol": x["symbol"],
                 "price": x["price"],
                 "change": x["change"],
+                "volume": x["volume"],
                 "exchange": x["exchange"]
             }
             for x in TOP_GAINERS_DATA[:10]
@@ -506,22 +607,22 @@ def parse_finnhub_time(value):
 
 
 def gainer_reason(symbol):
-    """إرجاع سبب مدعوم بمصدر حديث؛ لا نخمن سبب الحركة."""
+    """
+    أحدث خبر (أو إيداع SEC إن لم يوجد خبر) منذ إغلاق آخر يوم تداول.
+    طلب واحد للأخبار، وطلب الإيداعات فقط عند عدم وجود خبر.
+    لا نخمن سبب الحركة: هذا مجرد مصدر متزامن.
+    """
+    start = reason_window_start()
     today = now().date()
-    yesterday = today - timedelta(days=1)
-    news_items = finnhub("company-news", {
+    params = {
         "symbol": symbol,
-        "from": yesterday.isoformat(),
+        "from": start.date().isoformat(),
         "to": today.isoformat()
-    })
-    filings = finnhub("stock/filings", {
-        "symbol": symbol,
-        "from": yesterday.isoformat(),
-        "to": today.isoformat()
-    })
+    }
 
-    candidates = []
+    news_items = finnhub("company-news", params)
 
+    best = None
     if isinstance(news_items, list):
         for article in news_items:
             headline = (article.get("headline") or "").strip()
@@ -529,40 +630,77 @@ def gainer_reason(symbol):
             published = parse_finnhub_time(article.get("datetime"))
             if not headline or not link or not published:
                 continue
-            # نقبل الخبر المنشور اليوم بتوقيت نيويورك فقط.
-            if published.date() != today:
+            if published < start:
                 continue
-            candidates.append((published, "news", headline, link))
+            if best is None or published > best[0]:
+                best = (published, headline, link)
 
+    if best:
+        return {"kind": "news", "title": best[1], "link": best[2]}
+
+    filings = finnhub("stock/filings", params)
+
+    best = None
     if isinstance(filings, list):
         for filing in filings:
             form = str(filing.get("form", "")).upper().strip()
             if form not in SEC_FORMS:
                 continue
+
             filed_text = str(filing.get("filedDate") or "").strip()
             try:
                 filed_date = datetime.strptime(filed_text[:10], "%Y-%m-%d").date()
             except ValueError:
                 continue
-            if filed_date != today:
+
+            if filed_date < start.date():
                 continue
+
             link = (filing.get("filingUrl") or filing.get("reportUrl") or "").strip()
             if not link:
                 continue
-            # تاريخ الإيداع موثق، لكن لا نفترض أن الإيداع سبب الارتفاع وحده.
-            filed_dt = datetime.combine(filed_date, datetime.min.time(), tzinfo=TZ)
-            candidates.append((filed_dt, "sec", form, link))
 
-    if not candidates:
-        return ""
+            if best is None or filed_date > best[0]:
+                best = (filed_date, form, link)
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    _, kind, _, _ = candidates[0]
-    return "خبر" if kind == "news" else "نموذج"
+    if best:
+        return {
+            "kind": "sec",
+            "title": f"إيداع SEC: نموذج {best[1]}",
+            "link": best[2]
+        }
+
+    return None
+
+
+def format_gainer(index, item):
+    symbol = item["symbol"]
+    line = (
+        f"{index}. 🔹 {symbol} {short_money(item['price'])} "
+        f"(+{item['change']:.2f}%) | حجم {fmt_volume(item['volume'])}"
+    )
+
+    reason = gainer_reason(symbol)
+
+    if not reason:
+        return line + "\n   ⚪ لا يوجد خبر أو إيداع موثق في هذه الفترة"
+
+    if reason["kind"] == "news":
+        title = translate(reason["title"]).strip()
+        if len(title) > 160:
+            title = title[:157] + "..."
+        return f"{line}\n   📰 {title}\n   🔗 {reason['link']}"
+
+    return f"{line}\n   📄 {reason['title']}\n   🔗 {reason['link']}"
 
 
 # =============== TOP GAINERS ===============
 def process_gainers():
+    sess = session_name()
+    if not sess:
+        logging.info("GAINERS skipped: outside extended hours")
+        return 0
+
     # هذا القسم وحده لا يطبق شرط MAX_PRICE.
     top = TOP_GAINERS_DATA[:TOP_COUNT]
 
@@ -570,7 +708,7 @@ def process_gainers():
         logging.warning("TOP GAINERS: no Nasdaq gainers returned")
         return 0
 
-    # السماح برسالة واحدة في كل فترة ربع ساعة (00، 15، 30، 45).
+    # رسالة واحدة في كل فترة ربع ساعة (00، 15، 30، 45).
     current_time = now()
     quarter_hour = (current_time.minute // 15) * 15
     bucket = current_time.replace(minute=quarter_hour, second=0, microsecond=0)
@@ -578,28 +716,18 @@ def process_gainers():
     if sent(key):
         return 0
 
-    # جدول نصي بأربعة أعمدة؛ روابط المصادر تبقى قابلة للنقر في Telegram.
-    rows = [
-        "الرمز | السعر | النسبة | سبب الارتفاع",
-        "--- | ---: | ---: | ---"
-    ]
-
-    for item in top:
-        symbol = item["symbol"]
-        reason = gainer_reason(symbol)
-        rows.append(
-            f"{symbol} | {money(item['price'])} | "
-            f"+{item['change']:.2f}% | {reason}"
-        )
-        time.sleep(0.25)
+    lines = []
+    for i, item in enumerate(top, 1):
+        lines.append(format_gainer(i, item))
 
     msg = (
-        "🏆 أكثر 10 أسهم ارتفاعاً\n\n"
-        + "\n".join(rows)
+        SESSION_TITLES[sess] + "\n\n"
+        + "\n\n".join(lines)
         + f"\n\n🕒 {time_text()}\n"
-        "المصدر: Nasdaq Screener / Finnhub / SEC\n"
-        "ملاحظة: الخبر أو الإيداع متزامن وموثق، ولا يعني بالضرورة أنه السبب المؤكد للارتفاع. "
-        "هذا القسم وحده لا يطبق حد السعر الأقل من 5 دولارات."
+        f"المصدر: Nasdaq Screener / Finnhub / SEC\n"
+        f"الفلاتر: سعر ≥ ${MIN_GAINER_PRICE:.2f} وحجم ≥ {MIN_GAINER_VOLUME:,}\n"
+        "ملاحظة: الخبر أو الإيداع متزامن وموثق، ولا يعني بالضرورة أنه السبب المؤكد "
+        "للارتفاع. هذا القسم لا يطبق حد السعر الأقل من 5 دولارات."
     )
 
     if send(msg):
@@ -648,13 +776,14 @@ def process_moves(movers):
 
 # =============== MOMENTUM ===============
 def candles(symbol):
-    # Yahoo chart endpoint منفصل عن Yahoo screener الذي أعاد 401.
+    # includePrePost=true لتشمل الشموع ما قبل الافتتاح وما بعد الإغلاق.
     try:
         r = session.get(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
             params={
                 "range": "1d",
-                "interval": "5m"
+                "interval": "5m",
+                "includePrePost": "true"
             },
             timeout=20
         )
@@ -673,7 +802,7 @@ def candles(symbol):
 
 
 def process_momentum(movers):
-    if not market_open():
+    if not session_name():
         return 0
 
     count = 0
@@ -873,8 +1002,8 @@ def halt_symbol(text):
 
 
 def process_halts():
-    if not market_open():
-        logging.info("HALT scan skipped: market closed")
+    if not session_name():
+        logging.info("HALT scan skipped: outside extended hours")
         return 0
 
     try:
@@ -959,7 +1088,7 @@ def main():
     HALT_PRICE_CHECKS = 0
     TOP_GAINERS_DATA = []
 
-    logging.info("Foras Market US started")
+    logging.info(f"Foras Market US started | session={session_name()}")
 
     if not TOKEN or not CHAT_ID or not API_KEY:
         logging.error("Missing Telegram or Finnhub settings")
