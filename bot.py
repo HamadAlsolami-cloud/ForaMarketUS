@@ -224,8 +224,19 @@ def money(value):
     return f"${value:.4f}" if value else "غير متاح"
 
 # =============== MARKET MOVERS ===============
+
 def market_movers():
     candidates = {}
+
+    stats = {
+        "received": 0,
+        "exchange": 0,
+        "equity": 0,
+        "valid_price": 0,
+        "under_5": 0
+    }
+
+    samples = []
 
     for screener in ("day_gainers", "day_losers"):
         try:
@@ -242,26 +253,33 @@ def market_movers():
             r.raise_for_status()
 
             data = r.json().get("finance", {}).get("result") or []
-
             if not data:
                 logging.warning(f"Yahoo {screener}: empty result")
                 continue
 
             quotes = data[0].get("quotes", [])
-
-            logging.info(
-                f"Yahoo {screener}: received {len(quotes)} stocks"
-            )
+            stats["received"] += len(quotes)
 
             for x in quotes:
                 symbol = str(x.get("symbol", "")).upper()
                 exchange = str(x.get("exchange", "")).upper()
+                quote_type = str(x.get("quoteType", "")).upper()
 
-                if not symbol or exchange not in EXCHANGES:
-                    continue
+                if len(samples) < 8:
+                    samples.append({
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "quoteType": quote_type,
+                        "price": x.get("regularMarketPrice")
+                    })
 
-                if x.get("quoteType") != "EQUITY":
+                if exchange not in EXCHANGES:
                     continue
+                stats["exchange"] += 1
+
+                if quote_type != "EQUITY":
+                    continue
+                stats["equity"] += 1
 
                 try:
                     p = float(x.get("regularMarketPrice", 0))
@@ -271,8 +289,13 @@ def market_movers():
                 except (ValueError, TypeError):
                     continue
 
+                if p <= 0:
+                    continue
+                stats["valid_price"] += 1
+
                 if not eligible(p):
                     continue
+                stats["under_5"] += 1
 
                 candidates[symbol] = {
                     "symbol": symbol,
@@ -283,11 +306,9 @@ def market_movers():
         except Exception as e:
             logging.warning(f"Yahoo {screener}: {e}")
 
-    logging.info(
-        f"Yahoo eligible candidates: {len(candidates)}"
-    )
+    logging.info(f"YAHOO FILTER STATS: {stats}")
+    logging.info(f"YAHOO SAMPLE: {samples}")
 
-    # فحص الأقوى صعوداً وهبوطاً أولاً
     ordered = sorted(
         candidates.values(),
         key=lambda x: abs(x["change"]),
@@ -298,7 +319,6 @@ def market_movers():
 
     for item in ordered:
         if PRICE_CHECKS >= MAX_PRICE_CHECKS:
-            logging.warning("General price-check limit reached")
             break
 
         p = price(item["symbol"], "general")
@@ -308,7 +328,7 @@ def market_movers():
             verified.append(item)
 
     logging.info(
-        f"Finnhub verified stocks: {len(verified)} "
+        f"Finnhub verified: {len(verified)} "
         f"| Checks: {PRICE_CHECKS}/{MAX_PRICE_CHECKS}"
     )
 
