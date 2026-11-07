@@ -246,18 +246,33 @@ def extract_halt_symbol(text):
 
 def process_halts():
 
-    logging.info("Checking Nasdaq trading halts...")
+    from zoneinfo import ZoneInfo
+    from datetime import time as dt_time
+
+    logging.info("Checking HALT UP / HALT DOWN...")
 
     halt_count = 0
+
+    # جلسة التداول الأمريكية بتوقيت نيويورك
+    now_ny = datetime.now(ZoneInfo("America/New_York"))
+
+    if now_ny.weekday() >= 5:
+        logging.info("Market closed: weekend.")
+        return 0
+
+    market_open = dt_time(9, 30)
+    market_close = dt_time(16, 0)
+
+    if not (market_open <= now_ny.time() < market_close):
+        logging.info("Outside regular market hours.")
+        return 0
 
     try:
         response = session.get(
             NASDAQ_HALT_URL,
             timeout=20
         )
-
         response.raise_for_status()
-
         feed = feedparser.parse(response.content)
 
     except Exception as error:
@@ -266,11 +281,31 @@ def process_halts():
 
     for item in feed.entries:
 
-        title = item.get("title", "Trading Halt")
+        title = item.get("title", "")
         summary = item.get("summary", "")
         link = item.get("link", "")
 
-        full_text = f"{title} {summary}"
+        full_text = f"{title} {summary}".upper()
+
+        # استبعاد الاستئناف
+        if any(word in full_text for word in [
+            "RESUME",
+            "RESUMPTION",
+            "TRADING RESUMES"
+        ]):
+            continue
+
+        # تحديد اتجاه الإيقاف من رمز السبب
+        if re.search(r"\bT1\b", full_text):
+            halt_type = "HALT UP"
+            emoji = "🟢"
+
+        elif re.search(r"\bT2\b", full_text):
+            halt_type = "HALT DOWN"
+            emoji = "🔴"
+
+        else:
+            continue
 
         alert_id = make_id(
             "HALT_" + link if link else full_text
@@ -281,26 +316,13 @@ def process_halts():
 
         symbol = extract_halt_symbol(full_text)
 
-        lower_text = full_text.lower()
-
-        if any(word in lower_text for word in [
-            "resum",
-            "resumption",
-            "trading resumes"
-        ]):
-            alert_type = "استئناف التداول"
-            emoji = "🟢"
-        else:
-            alert_type = "إيقاف التداول"
-            emoji = "🔴"
-
         arabic_title = translate_arabic(title)
 
         message = (
-            f"{emoji} تنبيه تداول عاجل\n\n"
-            f"النوع: {alert_type}\n"
-            f"الرمز: {symbol}\n\n"
-            f"التفاصيل:\n{arabic_title}\n\n"
+            f"{emoji} {halt_type}\n\n"
+            f"السهم: {symbol}\n"
+            f"نوع الإيقاف: {halt_type}\n"
+            f"التفاصيل: {arabic_title}\n\n"
             f"المصدر: Nasdaq Trader\n"
             f"{link}"
         )
@@ -310,7 +332,6 @@ def process_halts():
             halt_count += 1
 
     return halt_count
-
 
 # ==========================================
 # GENERAL MARKET NEWS
