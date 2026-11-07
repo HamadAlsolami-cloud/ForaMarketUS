@@ -554,19 +554,11 @@ def gainer_reason(symbol):
             candidates.append((filed_dt, "sec", form, link))
 
     if not candidates:
-        return "⚪ بدون سبب معلن"
+        return ""
 
     candidates.sort(key=lambda item: item[0], reverse=True)
-    _, kind, detail, link = candidates[0]
-
-    if kind == "news":
-        short = translate(detail)
-        short = re.sub(r"\s+", " ", short).strip()
-        if len(short) > 115:
-            short = short[:112].rstrip() + "..."
-        return f"📰 خبر متزامن: {short} | {link}"
-
-    return f"📄 نموذج SEC {detail} (إيداع اليوم) | {link}"
+    _, kind, _, _ = candidates[0]
+    return "خبر" if kind == "news" else "نموذج"
 
 
 # =============== TOP GAINERS ===============
@@ -588,17 +580,15 @@ def process_gainers():
 
     # جدول نصي بأربعة أعمدة؛ روابط المصادر تبقى قابلة للنقر في Telegram.
     rows = [
-        "الاسم | السعر | النسبة | سبب الارتفاع",
+        "الرمز | السعر | النسبة | سبب الارتفاع",
         "--- | ---: | ---: | ---"
     ]
 
     for item in top:
         symbol = item["symbol"]
         reason = gainer_reason(symbol)
-        display_name = (item.get("name") or "").strip()
-        stock_name = f"{display_name} ({symbol})" if display_name else symbol
         rows.append(
-            f"{stock_name} | {money(item['price'])} | "
+            f"{symbol} | {money(item['price'])} | "
             f"+{item['change']:.2f}% | {reason}"
         )
         time.sleep(0.25)
