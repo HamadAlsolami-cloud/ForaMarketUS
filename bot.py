@@ -1,385 +1,518 @@
 
 import os
-import requests
-import hashlib
+import re
 import json
-import time
-from datetime import datetime, timedelta, timezone
+import hashlib
+import logging
+from datetime import datetime, timezone
 
-# ==================================
-# إعدادات الاتصال
-# ==================================
+import requests
+import feedparser
+
+# =========================================================
+# FORAS MARKET US - Dynamic Scanner
+# النسخة المجانية الأولية
+# =========================================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
-BASE_URL = "https://finnhub.io/api/v1"
 STATE_FILE = "alert_state.json"
 
-MAX_PRICE = 5.00
+FINNHUB_URL = "https://finnhub.io/api/v1"
+NASDAQ_HALT_RSS = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+
+MAX_NEWS_PER_RUN = 10
+MAX_SYMBOLS_PER_RUN = 8
 MOVE_ALERT_PERCENT = 5.0
 MAX_MESSAGE_LENGTH = 3500
 
-# ==================================
-# الأسهم المبدئية للمراقبة
-# ==================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-WATCHLIST = [
-    "ATCH", "DVLT", "INLF", "XLAB", "LAES",
-    "AREB", "ASST", "PFSA", "FLYE", "DFLI",
-    "APLT", "GNS", "CYBH", "CYPH", "PAVS",
-    "CXAI", "TMDE", "PSIG", "PBM", "ELAB",
-    "AMIX", "YYGH", "SMTK", "KXIN", "KNRX",
-    "XRPN"
-]
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "ForasMarketUS/1.0"
+})
 
-# ==================================
-# الكلمات المهمة للأخبار
-# ==================================
 
-IMPORTANT_KEYWORDS = [
-    "contract", "partnership", "merger", "acquisition",
-    "fda", "approval", "clinical trial", "earnings",
-    "sec filing", "8-k", "13d", "13g", "form 4",
-    "nasdaq", "compliance", "revenue", "guidance",
-    "strategic", "government", "award", "orders",
-    "offering", "bankruptcy", "delisting", "halt"
-]
-
-# ==================================
-# حالة التنبيهات السابقة
-# ==================================
+# =========================================================
+# STATE
+# =========================================================
 
 def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {
+            "news": [],
+            "halts": [],
+            "moves": []
+        }
+
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"news": [], "moves": []}
+        return {
+            "news": data.get("news", []),
+            "halts": data.get("halts", []),
+            "moves": data.get("moves", [])
+        }
+
+    except Exception:
+        logging.exception("Could not read state file")
+        return {
+            "news": [],
+            "halts": [],
+            "moves": []
+        }
 
 
-def save_state(state):
-    state["news"] = state["news"][-1000:]
-    state["moves"] = state["moves"][-1000:]
-
-    with open(STATE_FILE, "w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False)
+state = load_state()
 
 
-# ==================================
-# إرسال رسائل تيليجرام
-# ==================================
+def save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
 
-def send_message(message):
+    except Exception:
+        logging.exception("Could not save state")
+
+
+def remember(category, item_id, limit=2000):
+    items = state.setdefault(category, [])
+
+    if item_id in items:
+        return False
+
+    items.append(item_id)
+
+    if len(items) > limit:
+        state[category] = items[-limit:]
+
+    return True
+
+
+def make_id(value):
+    return hashlib.sha256(
+        str(value).encode("utf-8")
+    ).hexdigest()
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+def send_telegram(message):
+    if not TOKEN or not CHAT_ID:
+        logging.error("Telegram credentials are missing")
+        return False
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-    for attempt in range(4):
-
-        response = requests.post(
+    try:
+        response = session.post(
             url,
             data={
                 "chat_id": CHAT_ID,
                 "text": message,
                 "disable_web_page_preview": True
             },
-            timeout=30
+            timeout=20
         )
-
-        if response.status_code == 429:
-
-            try:
-                data = response.json()
-                wait_time = data.get(
-                    "parameters", {}
-                ).get("retry_after", 5)
-
-            except (ValueError, AttributeError):
-                wait_time = 5
-
-            print(
-                f"Telegram rate limit. "
-                f"Waiting {wait_time} seconds."
-            )
-
-            if attempt < 3:
-                time.sleep(wait_time + 1)
-                continue
 
         response.raise_for_status()
+        result = response.json()
 
-        print("Telegram message sent successfully")
+        if not result.get("ok"):
+            logging.error("Telegram returned an unsuccessful response")
+            return False
+
+        return True
+
+    except Exception:
+        logging.exception("Telegram sending failed")
+        return False
+
+
+def send_long_message(message):
+    if len(message) <= MAX_MESSAGE_LENGTH:
+        send_telegram(message)
         return
 
+    parts = []
 
-# ==================================
-# تقسيم التنبيهات حسب حد تيليجرام
-# ==================================
-
-def send_alerts(alerts):
-
-    if not alerts:
-        print("No new qualifying alerts")
-        return
-
-    header = "🦅 فرص السوق الأمريكي\n\n"
-    separator = "\n━━━━━━━━━━━━━━\n"
-
-    messages = []
-    current_message = header
-
-    for alert in alerts:
-
-        if len(alert) > MAX_MESSAGE_LENGTH - len(header):
-            alert = alert[:MAX_MESSAGE_LENGTH - len(header) - 30]
-
-        addition = alert + separator
-
-        if len(current_message) + len(addition) > MAX_MESSAGE_LENGTH:
-
-            messages.append(current_message)
-            current_message = header + addition
-
-        else:
-            current_message += addition
-
-    if current_message.strip() != header.strip():
-        messages.append(current_message)
-
-    for index, message in enumerate(messages):
-
-        send_message(message)
-
-        print(
-            f"Sent message {index + 1} "
-            f"of {len(messages)}"
+    while message:
+        split_at = message.rfind(
+            "\n",
+            0,
+            MAX_MESSAGE_LENGTH
         )
 
-        if index < len(messages) - 1:
-            time.sleep(1.2)
+        if split_at < 500:
+            split_at = MAX_MESSAGE_LENGTH
+
+        parts.append(message[:split_at])
+        message = message[split_at:].lstrip()
+
+    for part in parts:
+        send_telegram(part)
 
 
-# ==================================
-# الاتصال بـ Finnhub
-# ==================================
+# =========================================================
+# ARABIC TRANSLATION
+# خدمة مجانية غير رسمية - قد تتوقف أو تفرض حدوداً
+# =========================================================
 
-def finnhub_request(endpoint, params):
+def translate_arabic(text):
+    if not text:
+        return "لا يوجد ملخص"
 
-    request_params = params.copy()
-    request_params["token"] = FINNHUB_KEY
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
 
-    response = requests.get(
-        f"{BASE_URL}/{endpoint}",
-        params=request_params,
-        timeout=20
-    )
+        response = session.get(
+            url,
+            params={
+                "client": "gtx",
+                "sl": "auto",
+                "tl": "ar",
+                "dt": "t",
+                "q": text[:2500]
+            },
+            timeout=12
+        )
 
-    response.raise_for_status()
+        response.raise_for_status()
+        data = response.json()
 
-    return response.json()
+        translated = "".join(
+            part[0]
+            for part in data[0]
+            if part and part[0]
+        )
 
+        return translated or text
+
+    except Exception:
+        logging.warning("Translation unavailable")
+        return "تعذرت الترجمة، النص الأصلي:\n" + text
+
+
+# =========================================================
+# FINNHUB NEWS
+# اكتشاف الرموز من الأخبار بدلاً من قائمة ثابتة
+# =========================================================
+
+def get_general_news():
+    if not FINNHUB_API_KEY:
+        logging.error("FINNHUB_API_KEY is missing")
+        return []
+
+    try:
+        response = session.get(
+            f"{FINNHUB_URL}/news",
+            params={
+                "category": "general",
+                "token": FINNHUB_API_KEY
+            },
+            timeout=20
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        return data if isinstance(data, list) else []
+
+    except Exception:
+        logging.exception("Finnhub news request failed")
+        return []
+
+
+def get_related_symbols(news):
+    symbols = set()
+
+    for item in news:
+        related = item.get("related", "")
+
+        if isinstance(related, str):
+            for symbol in related.split(","):
+                symbol = symbol.strip().upper()
+
+                if re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", symbol):
+                    symbols.add(symbol)
+
+        # استخراج الرموز المكتوبة بصيغة $TICKER فقط
+        text = (
+            str(item.get("headline", "")) + " " +
+            str(item.get("summary", ""))
+        )
+
+        for symbol in re.findall(r"\$([A-Z]{1,5})\b", text):
+            symbols.add(symbol)
+
+    # استبعاد بعض الكلمات الشائعة التي قد تُفهم كرموز
+    excluded = {
+        "CEO", "USA", "SEC", "FDA", "NYSE",
+        "IPO", "ETF", "AI", "THE", "USD"
+    }
+
+    return sorted(symbols - excluded)
+
+
+def process_news(news_items):
+    count = 0
+
+    for item in news_items[:MAX_NEWS_PER_RUN]:
+        headline = str(item.get("headline", "")).strip()
+        summary = str(item.get("summary", "")).strip()
+        link = str(item.get("url", "")).strip()
+        related = str(item.get("related", "")).strip()
+
+        if not headline:
+            continue
+
+        news_id = make_id(
+            item.get("id") or link or headline
+        )
+
+        if not remember("news", news_id):
+            continue
+
+        arabic_headline = translate_arabic(headline)
+
+        arabic_summary = (
+            translate_arabic(summary[:1200])
+            if summary else "لا يوجد ملخص متاح"
+        )
+
+        message = (
+            "📰 خبر جديد - فرص السوق الأمريكي\n\n"
+            f"العنوان:\n{arabic_headline}\n\n"
+            f"الملخص:\n{arabic_summary}\n\n"
+            f"الرموز المرتبطة: {related or 'غير محددة'}\n"
+            f"المصدر: {item.get('source', 'Finnhub')}\n"
+        )
+
+        if link:
+            message += f"\nرابط الخبر:\n{link}"
+
+        send_long_message(message)
+        count += 1
+
+    return count
+
+
+# =========================================================
+# STOCK QUOTES
+# =========================================================
 
 def get_quote(symbol):
+    try:
+        response = session.get(
+            f"{FINNHUB_URL}/quote",
+            params={
+                "symbol": symbol,
+                "token": FINNHUB_API_KEY
+            },
+            timeout=15
+        )
 
-    return finnhub_request(
-        "quote",
-        {"symbol": symbol}
-    )
+        response.raise_for_status()
+        data = response.json()
 
+        if not data or not data.get("c"):
+            return None
 
-def get_company_news(symbol):
+        return data
 
-    today = datetime.now(timezone.utc).date()
-    start = today - timedelta(days=2)
-
-    return finnhub_request(
-        "company-news",
-        {
-            "symbol": symbol,
-            "from": start.isoformat(),
-            "to": today.isoformat()
-        }
-    )
-
-
-# ==================================
-# فلترة الأخبار المهمة
-# ==================================
-
-def is_important_news(item):
-
-    text = (
-        str(item.get("headline", "")) + " " +
-        str(item.get("summary", ""))
-    ).lower()
-
-    return any(
-        word in text
-        for word in IMPORTANT_KEYWORDS
-    )
+    except Exception:
+        logging.warning("Quote unavailable for %s", symbol)
+        return None
 
 
-def news_id(item):
+def process_price_moves(symbols):
+    alerts = 0
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    value = (
-        str(item.get("id", "")) +
-        str(item.get("url", "")) +
-        str(item.get("headline", ""))
-    )
+    for symbol in symbols[:MAX_SYMBOLS_PER_RUN]:
+        quote = get_quote(symbol)
 
-    return hashlib.sha256(
-        value.encode()
-    ).hexdigest()
+        if not quote:
+            continue
 
+        price = quote.get("c", 0)
+        change = quote.get("dp", 0)
+        previous = quote.get("pc", 0)
 
-# ==================================
-# مراقبة الأسهم
-# ==================================
+        if not isinstance(price, (int, float)) or price <= 0:
+            continue
 
-def scan_stocks(state):
+        if not isinstance(change, (int, float)):
+            continue
 
-    news_sent = set(state["news"])
-    moves_sent = set(state["moves"])
+        if abs(change) < MOVE_ALERT_PERCENT:
+            continue
 
-    alerts = []
+        direction = "صعود" if change > 0 else "هبوط"
+        move_id = f"{today}_{symbol}_{direction}"
 
-    for symbol in WATCHLIST:
+        if not remember("moves", move_id):
+            continue
 
-        try:
+        message = (
+            "📊 تنبيه حركة سعرية\n\n"
+            f"السهم: {symbol}\n"
+            f"السعر الحالي: ${price:.4f}\n"
+            f"الإغلاق السابق: ${previous:.4f}\n"
+            f"التغير اليومي: {change:+.2f}%\n"
+            f"الاتجاه: {direction}\n\n"
+            "⚠️ هذا رصد لحركة السعر وليس توصية تداول."
+        )
 
-            quote = get_quote(symbol)
-
-            price = float(quote.get("c", 0) or 0)
-            change = float(quote.get("dp", 0) or 0)
-
-            if price <= 0:
-                continue
-
-            if price >= MAX_PRICE:
-                continue
-
-            print(
-                f"{symbol}: ${price:.4f} | "
-                f"{change:+.2f}%"
-            )
-
-            # تنبيه الحركة السعرية
-
-            if abs(change) >= MOVE_ALERT_PERCENT:
-
-                direction = (
-                    "صعود" if change > 0 else "هبوط"
-                )
-
-                move_key = (
-                    f"{symbol}-"
-                    f"{datetime.now(timezone.utc).date()}-"
-                    f"{direction}"
-                )
-
-                if move_key not in moves_sent:
-
-                    alerts.append(
-                        f"📊 تنبيه حركة سعرية\n"
-                        f"السهم: {symbol}\n"
-                        f"السعر: ${price:.4f}\n"
-                        f"التغير اليومي: {change:+.2f}%\n"
-                        f"الاتجاه: {direction}\n"
-                    )
-
-                    moves_sent.add(move_key)
-
-            # أخبار الشركة
-
-            try:
-
-                news_items = get_company_news(symbol)
-
-                for item in news_items[:20]:
-
-                    if not is_important_news(item):
-                        continue
-
-                    identifier = news_id(item)
-
-                    if identifier in news_sent:
-                        continue
-
-                    headline = item.get(
-                        "headline",
-                        "خبر جديد"
-                    )
-
-                    link = item.get("url", "")
-
-                    alerts.append(
-                        f"🚨 خبر مهم: {symbol}\n"
-                        f"📰 {headline}\n"
-                        f"💵 السعر: ${price:.4f}\n"
-                        f"📈 التغير اليومي: {change:+.2f}%\n"
-                        f"🔗 {link}\n"
-                    )
-
-                    news_sent.add(identifier)
-
-            except Exception as error:
-
-                print(
-                    f"News error {symbol}: {error}"
-                )
-
-        except Exception as error:
-
-            print(
-                f"Quote error {symbol}: {error}"
-            )
-
-    state["news"] = list(news_sent)
-    state["moves"] = list(moves_sent)
+        send_telegram(message)
+        alerts += 1
 
     return alerts
 
 
-# ==================================
-# تشغيل البوت
-# ==================================
+# =========================================================
+# NASDAQ TRADER HALT RSS
+# يغطي أسهم Nasdaq والأسهم المدرجة في بورصات أخرى
+# =========================================================
+
+def extract_halt_symbol(title, description):
+    text = f"{title} {description}"
+
+    match = re.search(
+        r"(?:security|symbol)\s+([A-Z][A-Z0-9.-]{0,9})",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        return match.group(1).upper()
+
+    clean_title = title.strip().upper()
+
+    if re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", clean_title):
+        return clean_title
+
+    return None
+
+
+def process_halts():
+    try:
+        response = session.get(
+            NASDAQ_HALT_RSS,
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        feed = feedparser.parse(response.content)
+
+        count = 0
+
+        for entry in feed.entries:
+            title = str(entry.get("title", "")).strip()
+            description = str(
+                entry.get("summary", "")
+            ).strip()
+
+            combined = f"{title} {description}"
+
+            if not title:
+                continue
+
+            symbol = extract_halt_symbol(
+                title,
+                description
+            )
+
+            entry_id = make_id(
+                entry.get("id") or
+                entry.get("link") or
+                combined
+            )
+
+            if not remember("halts", entry_id):
+                continue
+
+            if re.search(r"\b(resum|resumption)\b", combined, re.I):
+                event = "استئناف تداول"
+                emoji = "🟢"
+            else:
+                event = "إيقاف تداول"
+                emoji = "🛑"
+
+            message = (
+                f"{emoji} تنبيه {event}\n\n"
+                f"السهم: {symbol or 'غير محدد'}\n"
+                f"التفاصيل:\n{title}\n"
+                f"{description}\n\n"
+                "المصدر: Nasdaq Trader RSS\n"
+                "ملاحظة: تحقق من حالة التداول لدى وسيطك."
+            )
+
+            send_long_message(message)
+            count += 1
+
+        return count
+
+    except Exception:
+        logging.exception("Nasdaq halt feed failed")
+        return 0
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
+    logging.info("Foras Market US scan started")
 
-    if not TOKEN or not CHAT_ID or not FINNHUB_KEY:
+    if not TOKEN or not CHAT_ID:
+        raise RuntimeError("Telegram secrets are missing")
 
-        raise ValueError(
-            "Missing API settings"
-        )
+    if not FINNHUB_API_KEY:
+        raise RuntimeError("Finnhub API key is missing")
 
-    print("Foras Market US started")
+    # 1 - Halt alerts
+    halt_count = process_halts()
 
-    state = load_state()
+    # 2 - General news
+    news_items = get_general_news()
+    news_count = process_news(news_items)
 
-    alerts = scan_stocks(state)
+    # 3 - Dynamic ticker discovery
+    symbols = get_related_symbols(news_items)
 
-    if alerts:
+    # 4 - Price movement alerts
+    move_count = process_price_moves(symbols)
 
-        print(
-            f"Total alerts found: {len(alerts)}"
-        )
+    # حفظ حالة التنبيهات لمنع التكرار
+    save_state()
 
-        send_alerts(alerts)
-
-    else:
-
-        print("No new qualifying alerts")
-
-    save_state(state)
+    logging.info(
+        "Scan completed | Halts: %s | News: %s | "
+        "Price alerts: %s | Symbols discovered: %s",
+        halt_count,
+        news_count,
+        move_count,
+        len(symbols)
+    )
 
     print("Scan completed successfully")
 
 
-# ==================================
-# بدء التشغيل
-# ==================================
-
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logging.exception("Bot execution failed")
+        save_state()
+        raise
