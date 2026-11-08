@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import fcntl
 import hashlib
 import logging
 import traceback
@@ -20,6 +21,12 @@ API_KEY = os.getenv("FINNHUB_API_KEY")
 MASSIVE_KEY = os.getenv("MASSIVE_API_KEY")
 
 STATE_FILE = os.getenv("STATE_FILE", "alert_state.json")
+LOCK_FILE = os.getenv("LOCK_FILE", "bot.lock")
+LOG_FILE = os.getenv("LOG_FILE", "bot.log")
+
+# فترة الانتظار بين التشغيلات (ثوانٍ) — افتراضي 15 دقيقة
+INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "900"))
+
 BASE = "https://finnhub.io/api/v1"
 NASDAQ_API = "https://api.nasdaq.com/api/screener/stocks"
 HALT_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
@@ -36,9 +43,11 @@ PRICE_LIMIT = 5.0
 MOMENTUM_LIMIT = 2.5
 
 MIN_VOLUME = 100_000
-PRE_MARKET_VOLUME_DIVISOR = 3   # يخفّض حد السيولة قبل الافتتاح
+PRE_MARKET_VOLUME_DIVISOR = 3
 NEWS_MAX_AGE_HOURS = 12
 HALT_MAX_AGE_HOURS = 4
+
+MIN_SEC_PRICE = 0.30
 
 NASDAQ_PAGE_SIZE = 5000
 NASDAQ_MAX_PAGES = 4
@@ -209,7 +218,6 @@ def send(message):
                 break
 
             except Exception as e:
-                # لا نسجل الـ URL لأنه يحتوي التوكن
                 logging.warning(f"Telegram error: {type(e).__name__}")
                 time.sleep(3)
         else:
@@ -282,7 +290,6 @@ def price(symbol, purpose="general"):
 
     q = finnhub("quote", {"symbol": symbol})
 
-    # فشل شبكي مؤقت — لا نخزّن حتى نعيد المحاولة في نفس التشغيل إن أمكن
     if q is None:
         return None
 
@@ -329,7 +336,6 @@ def parse_number(value):
         return None
 
 
-# كلمات كاملة فقط لتجنب حذف شركات حقيقية بالخطأ
 _EXCLUDE_RE = re.compile(
     r"\b(etf|etn|warrants?|units?|rights?|debentures?|"
     r"depositary shares?|exchange[- ]traded fund)\b"
@@ -635,7 +641,6 @@ def volume_metrics(symbol):
             rvol = current_day_volume / avg_daily
 
         minutes = (minute_data or {}).get("results", [])
-        # minutes[0] هي الأحدث وقد تكون غير مكتملة؛ نستخدم السابقة إن وُجدت
         if len(minutes) >= 2:
             one_minute = float(minutes[1].get("v", 0))
         elif minutes:
@@ -673,7 +678,6 @@ def candles(symbol):
         for ts, v in zip(timestamps, values):
             if v is None:
                 continue
-            # الشمعة مكتملة إذا مضى 5 دقائق كاملة على بدايتها
             if now_ts - ts >= 300:
                 clean.append(float(v))
 
@@ -690,7 +694,6 @@ def process_momentum(movers):
     today = now().strftime("%Y-%m-%d")
 
     for x in movers[:MAX_SCAN]:
-        # احترام ميزانية Finnhub مبكراً
         if PRICE_CHECKS >= MAX_PRICE_CHECKS:
             logging.warning("Momentum: price budget exhausted, stopping")
             break
@@ -814,6 +817,42 @@ def process_news(symbols):
 
 
 # =============== SEC FILINGS ===============
+SEC_8K_ITEMS = {
+    "1.01": "دخول اتفاقية جوهرية",
+    "1.02": "إنهاء اتفاقية جوهرية",
+    "1.03": "إفلاس أو حراسة قضائية ⚠️",
+    "2.01": "إتمام استحواذ أو بيع أصول",
+    "2.02": "نتائج مالية (أرباح/خسائر) 📊",
+    "2.03": "التزام مالي جديد",
+    "2.05": "تكاليف خروج/إعادة هيكلة",
+    "2.06": "انخفاض قيمة أصول ⚠️",
+    "3.01": "إشعار بعدم الامتثال لشروط الإدراج ⚠️",
+    "3.02": "بيع أسهم غير مسجل (تخفيف ملكية) ⚠️",
+    "3.03": "تغيير في حقوق المساهمين",
+    "4.01": "تغيير المدقق المالي",
+    "5.01": "تغيير في السيطرة",
+    "5.02": "تغيير في الإدارة (CEO/CFO)",
+    "7.01": "إفصاح منظم (Reg FD)",
+    "8.01": "أحداث أخرى مهمة",
+    "9.01": "بيانات مالية ومرفقات",
+}
+
+
+def format_8k_items(items_str):
+    """يحوّل '2.02,9.01' إلى قائمة أوصاف مقروءة."""
+    if not items_str:
+        return ""
+    lines = []
+    seen = set()
+    for code in re.findall(r"\d+\.\d+", str(items_str)):
+        if code in seen:
+            continue
+        seen.add(code)
+        desc = SEC_8K_ITEMS.get(code, "بند غير مصنّف")
+        lines.append(f"• {code}: {desc}")
+    return "\n".join(lines)
+
+
 def filing_label(form):
     if form in {"S-1", "F-1", "S-3", "F-3", "424B5"}:
         return "⚠️ تسجيل طرح أو إصدار أسهم؛ يجب فحص احتمال تخفيف الملكية"
@@ -841,7 +880,7 @@ def process_sec(symbols):
 
     for symbol in symbols[:MAX_SEC]:
         p = price(symbol)
-        if not eligible(p):
+        if p is None or not (MIN_SEC_PRICE <= p < MAX_PRICE):
             continue
 
         filings = finnhub("stock/filings", {
@@ -866,12 +905,26 @@ def process_sec(symbols):
             if sent(key):
                 continue
 
+            items_detail = ""
+            if form == "8-K":
+                items_raw = (
+                    filing.get("items")
+                    or filing.get("itemsDesc")
+                    or ""
+                )
+                detail = format_8k_items(items_raw)
+                if detail:
+                    items_detail = f"\nالبنود:\n{detail}\n"
+
+            filed_short = str(filed)[:10] if filed else "غير متاح"
+
             msg = (
                 f"📄 تنبيه إفصاح رسمي | {symbol}\n"
                 f"السعر: {money(p)}\n\n"
                 f"نوع النموذج: {form}\n"
                 f"التصنيف: {filing_label(form)}\n"
-                f"تاريخ الإيداع: {filed or 'غير متاح'}\n\n"
+                f"تاريخ الإيداع: {filed_short}\n"
+                f"{items_detail}\n"
                 "المصدر: SEC\n"
                 "ملاحظة: التصنيف يشرح نوع الإفصاح ولا يمثل توصية تداول."
             )
@@ -935,7 +988,6 @@ def process_halts():
     cutoff = now() - timedelta(hours=HALT_MAX_AGE_HOURS)
 
     for item in feed.entries:
-        # تجاهل HALT الأقدم من 4 ساعات (RSS قد يحتوي بيانات قديمة)
         published = item.get("published_parsed")
         if published:
             try:
@@ -951,10 +1003,8 @@ def process_halts():
         text = f"{title} {item.get('summary', '')} {item.get('description', '')}"
         upper = text.upper()
 
-        # تجاهل الاستئناف
         if re.search(r"\b(RESUMED|RESUME|RESUMPTION|TRADING RESUMES)\b", upper):
             continue
-        # تجاهل الحقول التي تعني أن الاستئناف قد حدث
         if str(item.get("ndaq_resumptiontradetime", "")).strip():
             continue
         if str(item.get("ndaq_resumptiondate", "")).strip():
@@ -1007,15 +1057,38 @@ def process_whales():
     return 0
 
 
+# =============== LOCK ===============
+def acquire_lock():
+    """يمنع تشغيل نسختين متزامنتين. يُرجع handle يجب إبقاؤه مفتوحاً."""
+    try:
+        f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logging.error(
+                f"Another instance is running (lock: {LOCK_FILE}). Exiting."
+            )
+            f.close()
+            return None
+        f.write(str(os.getpid()))
+        f.flush()
+        return f
+    except Exception as e:
+        logging.error(f"Lock error: {e}")
+        return None
+
+
 # =============== MAIN ===============
-def run():
+def run_once():
+    """ينفذ دورة كاملة واحدة ثم يعود."""
     global PRICE_CACHE, PRICE_CHECKS, HALT_PRICE_CHECKS
 
     PRICE_CACHE = {}
     PRICE_CHECKS = 0
     HALT_PRICE_CHECKS = 0
 
-    logging.info("Foras Market US started")
+    logging.info("=" * 50)
+    logging.info("Foras Market US: new cycle")
 
     if not TOKEN or not CHAT_ID or not API_KEY:
         logging.error("Missing TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID or FINNHUB_API_KEY")
@@ -1036,26 +1109,72 @@ def run():
     sec = process_sec(symbols)
 
     logging.info(
-        f"Done | HALT:{halt_count} | PRICE:{moves} | MOMENTUM:{momentum} | "
+        f"Cycle done | HALT:{halt_count} | PRICE:{moves} | MOMENTUM:{momentum} | "
         f"NEWS:{news} | SEC:{sec} | STOCKS:{len(movers)} | "
         f"PRICE CHECKS:{PRICE_CHECKS}/{MAX_PRICE_CHECKS} | "
         f"HALT CHECKS:{HALT_PRICE_CHECKS}/{MAX_HALT_PRICE_CHECKS}"
     )
 
 
-def main():
-    global _dirty
-    try:
-        run()
-    except Exception as e:
-        logging.error(f"Fatal: {e}\n{traceback.format_exc()}")
+def run_forever():
+    """حلقة تشغيل مستمرة مع فاصل زمني بين الدورات."""
+    logging.info(
+        f"Foras Market US started | "
+        f"interval={INTERVAL_SECONDS}s ({INTERVAL_SECONDS // 60} min)"
+    )
+
+    while True:
         try:
-            send(f"❌ خطأ في البوت: {type(e).__name__}: {str(e)[:300]}")
-        except Exception:
-            pass
+            run_once()
+        except KeyboardInterrupt:
+            logging.warning("Stopped by user (Ctrl+C)")
+            break
+        except Exception as e:
+            logging.error(f"Cycle error: {e}\n{traceback.format_exc()}")
+            try:
+                send(f"❌ خطأ في البوت: {type(e).__name__}: {str(e)[:300]}")
+            except Exception:
+                pass
+        finally:
+            if _dirty:
+                save_state()
+
+        logging.info(f"Sleeping {INTERVAL_SECONDS}s until next cycle...")
+        try:
+            time.sleep(INTERVAL_SECONDS)
+        except KeyboardInterrupt:
+            logging.warning("Sleep interrupted by user")
+            break
+
+
+def main():
+    """نقطة الدخول: قفل + إعداد logging + حلقة تشغيل."""
+    # إعداد ملف اللوج (يُضاف إلى stdout)
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
+        fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s"
+        ))
+        logging.getLogger().addHandler(fh)
+    except Exception as e:
+        logging.warning(f"File logging disabled: {e}")
+
+    lock_handle = acquire_lock()
+    if lock_handle is None:
+        return
+
+    try:
+        run_forever()
     finally:
+        # حفظ أخير عند الخروج
         if _dirty:
             save_state()
+        logging.info("Shutdown complete")
+        try:
+            lock_handle.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
